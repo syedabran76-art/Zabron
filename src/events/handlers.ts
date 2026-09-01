@@ -95,8 +95,23 @@ import { setAfk } from '../db/repositories.js';
 import { handleGiveawayJoin, handleGiveawayLeave } from '../commands/giveaways/giveaway.js';
 import { runWorkflowsForTrigger } from '../services/automation.js';
 import { truncate } from '../embeds/builders.js';
+import {
+  sendGuildWelcomeMessage,
+  buildMentionReplyPayload,
+} from '../services/onboarding.js';
 
 const recentMessagesByGuild = new Map<string, { content: string; ts: number; author: string }[]>();
+
+/**
+ * Per-channel cooldown for the bot-mention reply. Tracks the wall-clock
+ * timestamp of the last reply in each channel so repeated mentions in
+ * the same channel within `COOLDOWN_MS` are silently ignored.
+ *
+ * Intentionally per-process state: a restart legitimately resets the
+ * cooldown (rare edge case) and the map never grows beyond the number
+ * of channels the bot sees, so memory pressure is negligible.
+ */
+const mentionReplyCooldowns = new Map<string, number>();
 
 export function attachEventHandlers(client: any): void {
   client.on(Events.MessageCreate, (message: Message) => safeRun(() => onMessage(message, client), 'onMessage'));
@@ -150,6 +165,54 @@ async function onMessage(message: Message, client: any): Promise<void> {
   if (message.system) return;
 
   const guildId = message.guild.id;
+
+  // ----------------------------------------------------------------
+  // Bot mention response
+  // ----------------------------------------------------------------
+  // Direct mention of Zabron (`@Zabron`, `<@BOT_ID>`, `<@!BOT_ID>`)
+  // is the canonical "how do I get help" path. We reply with a
+  // polished embed that uses the GUILD'S ACTUAL prefix from the
+  // repository (never a hardcoded value).
+  //
+  // Spam protection:
+  //   - Per-channel cooldown (10s) so a user pinging the bot in a
+  //     busy channel can't trigger a flood of replies.
+  //   - The same channel+author pair cannot trigger twice within the
+  //     cooldown window (prevents accidental ping-loops).
+  //
+  // We use Discord's mention metadata (`message.mentions.has`) rather
+  // than a substring search so the bot never replies to messages that
+  // simply contain the substring "zabron".
+  const botUserId = client.user?.id;
+  const isBotMentioned =
+    !!botUserId &&
+    (message.mentions?.users?.has?.(botUserId) || message.mentions?.repliedUser?.id === botUserId);
+
+  if (isBotMentioned) {
+    const lastReply = mentionReplyCooldowns.get(message.channel.id);
+    const now = Date.now();
+    const COOLDOWN_MS = 10_000;
+    if (!lastReply || now - lastReply >= COOLDOWN_MS) {
+      try {
+        const { payload } = buildMentionReplyPayload(guildId);
+        // We use message.channel.send (NOT reply) so the bot's
+        // mention response is the most recent message in the channel
+        // — easier for the user to find, and avoids a "ping pong"
+        // visual where the bot is wedged between the trigger and the
+        // reply.
+        await (message.channel as any).send(payload);
+        mentionReplyCooldowns.set(message.channel.id, now);
+      } catch (err) {
+        // Never crash the gateway on a bot-mention send failure.
+        try {
+          console.warn('[zabron] bot mention reply failed:', (err as Error).message);
+        } catch {}
+      }
+    }
+    // We deliberately do NOT `return` here — the rest of the message
+    // pipeline (prefix commands, autoresponder, automod, etc.) still
+    // runs. The mention response is a courtesy, not a hard handler.
+  }
 
   // AFK notify (mention reply)
   const mentioned = message.mentions.users;
@@ -690,7 +753,23 @@ async function onGuildBanRemove(ban: any, client: any): Promise<void> {
 // ============================================================================
 
 async function onGuildCreate(g: any): Promise<void> {
+  // Always seed guild settings first so the welcome embed has a row to
+  // read its prefix from (even on a brand-new guild).
   getDatabase().prepare('INSERT OR IGNORE INTO guild_settings (guild_id, prefix, panic_mode, created_at, updated_at) VALUES (?, ?, 0, ?, ?)').run(g.id, '.', Date.now(), Date.now());
+
+  // Send the polished welcome message. The onboarding service is
+  // responsible for channel selection, idempotency (across reconnects),
+  // graceful failure, and never DMing random members. Any error here
+  // is caught at the safeRun() wrapper level — a welcome failure
+  // must NEVER crash the gateway.
+  try {
+    await sendGuildWelcomeMessage(g);
+  } catch (err) {
+    // Defensive double-wrap: sendGuildWelcomeMessage is already
+    // try/caught, but a thrown error here would otherwise bubble up
+    // into safeRun() and surface to stderr. Keep the message clear.
+    console.warn('[zabron] sendGuildWelcomeMessage threw unexpectedly:', (err as Error).message);
+  }
 }
 
 /**

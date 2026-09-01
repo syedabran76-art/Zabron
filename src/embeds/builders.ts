@@ -875,3 +875,168 @@ export function numberedList(
   }
   return [{ name: 'Results', value: content, inline: false }];
 }
+
+// ============================================================================
+// ONBOARDING & MENTION BUILDERS
+// ============================================================================
+
+/**
+ * Build the polished welcome embed sent to a guild right after the bot
+ * joins (`GuildCreate`).
+ *
+ * Layout contract:
+ *   - Title:    "Welcome to Zabron!"
+ *   - Desc:     "Protect • Automate • Manage" + value proposition
+ *   - Fields:   Getting Started / Setup / Prefix / Support
+ *   - Footer:   brand + tagline (centralized)
+ *   - Tone:     'welcome' (uses WELCOME_COLOR)
+ *
+ * The actual guild prefix is passed in by the caller — it is read from
+ * the repository at call time so the embed always shows the prefix
+ * users can actually use. We never assume a hardcoded prefix.
+ *
+ * `supportUrl` is optional: when omitted the Support field simply
+ * renders "Not configured" so the rest of the embed stays usable.
+ *
+ * Returned embed uses the existing tone/indicator system; no custom
+ * styles are introduced here.
+ */
+export function welcomeEmbed(opts: {
+  guildName: string;
+  /** The actual guild prefix from the repository (never hardcoded). */
+  prefix: string;
+  /**
+   * Optional pre-validated support server URL. When omitted or empty,
+   * the Support field renders "Not configured" and the caller skips
+   * adding a Support button row.
+   */
+  supportUrl?: string | null;
+}): EmbedBuilder {
+  // Falsy-coerce: empty string, null, undefined all fall back to ".".
+  // The repository always returns a non-empty string, but defensive
+  // coercion here keeps the embed correct even if a future caller
+  // forgets to validate.
+  const prefix = ((opts.prefix && opts.prefix.length > 0) ? opts.prefix : '.').slice(0, 16);
+  const guildName = (opts.guildName ?? 'this server').slice(0, 96);
+  const supportConfigured = !!opts.supportUrl && opts.supportUrl.trim().length > 0;
+
+  const description =
+    `Thanks for adding ${BRAND_NAME} to **${guildName}**!\n\n` +
+    `${BRAND_TAGLINE}\n\n` +
+    `I provide everything your community needs to stay safe, organized, ` +
+    `and engaged — moderation, security, automation, and community ` +
+    `management tools in one cohesive bot.`;
+
+  const fields: EmbedField[] = [
+    {
+      name: '🚀 Getting Started',
+      value:
+        `Run \`/help\` to browse every command, or check \`${prefix}help\` for ` +
+        `the full legacy command list.`,
+      inline: false,
+    },
+    {
+      name: '⚙️ Setup',
+      value:
+        `Run \`/setup\` to configure welcome messages, logging channels, ` +
+        `automod, antinuke and more — all in one guided flow.`,
+      inline: false,
+    },
+    {
+      name: '🔧 Prefix',
+      value:
+        `Your server prefix is \`${prefix}\`. You can change it any time ` +
+        `with \`/prefix set ${prefix}:new.prefix\`.`,
+      inline: true,
+    },
+    {
+      name: '💬 Support',
+      value: supportConfigured
+        ? 'Join the official support server for help, updates, and feedback.'
+        : 'Support server not configured by the bot owner yet.',
+      inline: true,
+    },
+  ];
+
+  return buildEmbed({
+    title: `Welcome to ${BRAND_NAME}!`,
+    description,
+    fields,
+    tone: 'welcome',
+    timestamp: Date.now(),
+  });
+}
+
+/**
+ * Build the polished reply sent when a user directly mentions Zabron
+ * (`<@BOT_ID>` / `@Zabron`).
+ *
+ * Layout contract:
+ *   - Title:    "👋 Hey! I'm Zabron."
+ *   - Desc:     short value proposition + how to get help
+ *   - Fields:   Commands / Prefix / Support
+ *   - Tone:     'info' (uses INFO_COLOR)
+ *
+ * `supportUrl` controls whether the Support field mentions the
+ * configured invite link textually; the caller decides whether to add
+ * a Link button row.
+ */
+export function mentionHelpEmbed(opts: {
+  /** The actual guild prefix from the repository. */
+  prefix: string;
+  /** Optional pre-validated support server URL. */
+  supportUrl?: string | null;
+}): EmbedBuilder {
+  // Falsy-coerce: empty string, null, undefined all fall back to ".".
+  const prefix = ((opts.prefix && opts.prefix.length > 0) ? opts.prefix : '.').slice(0, 16);
+  const supportConfigured = !!opts.supportUrl && opts.supportUrl.trim().length > 0;
+
+  const description =
+    `Use \`/help\` to explore my commands.\n` +
+    `Your server prefix is \`${prefix}\` — you can also use \`${prefix}help\`.`;
+
+  const fields: EmbedField[] = [
+    {
+      name: '📖 Commands',
+      value: `Run \`/help\` to see every command, or \`${prefix}help\` for the legacy list.`,
+      inline: false,
+    },
+    {
+      name: '⚙️ Setup',
+      value: `Run \`/setup\` to configure moderation, logging, automod and more.`,
+      inline: false,
+    },
+    {
+      name: '💬 Support',
+      value: supportConfigured
+        ? 'Join the Zabron Support Server for help and updates.'
+        : 'Support server is not configured by the bot owner yet.',
+      inline: true,
+    },
+  ];
+
+  return buildEmbed({
+    title: `👋 Hey! I'm ${BRAND_NAME}.`,
+    description,
+    fields,
+    tone: 'info',
+    timestamp: Date.now(),
+  });
+}
+
+/**
+ * Build the optional button row containing the Support button.
+ *
+ * Returns `null` when no URL is configured so callers can skip adding
+ * a row at all (Discord rejects empty ActionRows).
+ */
+export function supportButtonRow(opts: {
+  supportUrl: string | null;
+  label?: string;
+}): ActionRowBuilder<ButtonBuilder> | null {
+  if (!opts.supportUrl) return null;
+  const label = (opts.label ?? `💬 Support Server`).slice(0, 80);
+  return new ActionRowBuilder<ButtonBuilder>().addComponents(
+    linkButton(opts.supportUrl, label),
+  );
+}

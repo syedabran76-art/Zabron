@@ -1,0 +1,22 @@
+# Zabron .gitignore
+node_modules/
+dist/
+data/*.sqlite
+data/*.sqlite-journal
+data/*.sqlite-shm
+data/*.sqlite-wal
+.env
+.DS_Store
+*.log
+logs/
+.idea/
+.vscode/
+coverage/
+.test-build/
+.env
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+node_modules/
+.env.test
+.devx/

@@ -1,0 +1,35 @@
+{
+  "name": "zabron",
+  "version": "1.0.0",
+  "description": "ZABRON — A professional all-in-one Discord bot and server-management platform.",
+  "main": "dist/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node --experimental-sqlite --no-warnings dist/index.js",
+    "dev": "tsx --no-warnings src/index.ts",
+    "register": "node --no-warnings dist/handlers/registerCommands.js",
+    "test": "npx tsc -p tsconfig.test.json && node --experimental-sqlite --no-warnings --test --import tsx tests/*.test.ts",
+    "lint": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "moderation",
+    "security",
+    "zabron"
+  ],
+  "license": "MIT"
+}

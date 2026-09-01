@@ -124,6 +124,68 @@ export async function replyInfo(ctx: CommandContext, title: string, description?
   return respond(ctx, { embeds: [info(title, description)] });
 }
 
+// ---------- Category-specific helpers ----------
+
+export async function replyModeration(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { moderation } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [moderation(title, description)] });
+}
+
+export async function replySecurity(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { security } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [security(title, description)] });
+}
+
+export async function replyConfig(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { configuration } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [configuration(title, description)] });
+}
+
+export async function replyTicket(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { ticket } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [ticket(title, description)] });
+}
+
+export async function replyGiveaway(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { giveaway } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [giveaway(title, description)] });
+}
+
+export async function replyLeveling(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { leveling } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [leveling(title, description)] });
+}
+
+export async function replySystem(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { system } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [system(title, description)] });
+}
+
+export async function replyVoice(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { voice } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [voice(title, description)] });
+}
+
+export async function replyAutomation(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { automation } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [automation(title, description)] });
+}
+
+export async function replyCommunity(ctx: CommandContext, title: string, description?: string): Promise<Message | void> {
+  const { community } = await import('../embeds/builders.js');
+  return respond(ctx, { embeds: [community(title, description)] });
+}
+
+/**
+ * Convenience: defer a slash reply immediately so the interaction never
+ * shows "Application did not respond".
+ */
+export async function deferIfSlash(ctx: CommandContext, ephemeral = false): Promise<void> {
+  if (ctx.source === 'slash' && ctx.interaction && !ctx.interaction.deferred) {
+    await ctx.interaction.deferReply({ ephemeral });
+  }
+}
+
 /**
  * Edit an interaction that we deferred — convenience for slash flows.
  */

@@ -106,8 +106,31 @@ const ping: CommandDefinition = {
   parseSlash() { return {}; },
   parsePrefix() { return {}; },
   async run(ctx: CommandContext) {
-    const ws = ctx.guild?.client.ws.ping ?? 0;
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Pong!', description: `WebSocket latency: **${ws}ms**` })] });
+    const client = ctx.guild?.client ?? (ctx.interaction?.client);
+    const wsLatency = client?.ws.ping ?? 0;
+
+    // Real memory usage
+    const memUsage = process.memoryUsage?.() ?? null;
+    const memoryMB = memUsage
+      ? Math.round(memUsage.heapUsed / 1024 / 1024)
+      : 0;
+
+    // Real guild count
+    const guildCount = client?.guilds?.cache?.size ?? 0;
+
+    // Real uptime
+    const seconds = Math.floor((Date.now() - startedAt) / 1000);
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    const uptimeStr = days > 0
+      ? `${days}d ${hours}h ${minutes}m`
+      : hours > 0
+        ? `${hours}h ${minutes}m`
+        : `${minutes}m`;
+
+    const { pingResult } = await import('../../embeds/builders.js');
+    await respond(ctx, { embeds: [pingResult({ wsLatency, uptime: uptimeStr, memoryMB, guildCount })] });
   },
 };
 

@@ -9,7 +9,7 @@
     "start": "node --experimental-sqlite --no-warnings dist/index.js",
     "dev": "tsx --no-warnings src/index.ts",
     "register": "node --no-warnings dist/handlers/registerCommands.js",
-    "test": "npx tsc -p tsconfig.test.json && node --experimental-sqlite --no-warnings --test --import tsx tests/*.test.ts",
+    "test": "node --experimental-sqlite --no-warnings --test --import tsx tests/*.test.ts",
     "lint": "tsc --noEmit"
   },
   "engines": {

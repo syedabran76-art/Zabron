@@ -3,7 +3,10 @@
   "compilerOptions": {
     "rootDir": "./",
     "noEmit": true,
-    "outDir": "./.test-build"
+    "outDir": "./.test-build",
+    "module": "node16",
+    "moduleResolution": "node16",
+    "noImplicitAny": false
   },
   "include": ["src/**/*.ts", "tests/**/*.ts"],
   "exclude": ["node_modules", "dist", ".test-build"]

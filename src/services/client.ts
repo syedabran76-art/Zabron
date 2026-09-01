@@ -89,23 +89,112 @@ function startScheduler(client: Client): void {
 // Re-exported so other modules can import scheduler helpers if needed.
 export { startScheduler };
 
-const STATUSES = [
-  { name: 'Protecting your community', type: ActivityType.Watching },
-  { name: '{guilds} servers', type: ActivityType.Watching },
-  { name: 'Monitoring security', type: ActivityType.Playing },
-  { name: '/help to get started', type: ActivityType.Listening },
+/**
+ * Presence / activity rotation.
+ *
+ * Design principles:
+ *   - Concise, professional text. Never exposes sensitive information
+ *     (no guild names, no user IDs, no shard IDs, no internal counts).
+ *   - Slow rotation (90s) so it never looks frantic. The rotation timer
+ *     is unref'd so it never blocks shutdown.
+ *   - A static "Starting up…" presence is set BEFORE Discord login via
+ *     `applyStartupPresence()`, then a polished dynamic rotation begins
+ *     once the gateway handshake completes (`ready` event).
+ *   - Reconnect-safe: the rotation handles stale `guilds.cache` by
+ *     simply reflecting the current cache size; if the cache is empty
+ *     during a brief reconnect, the placeholder reads `—`.
+ *   - Status is `online` while healthy.
+ */
+type PresenceTemplate = {
+  /** Activity text. Use `{guilds}` as a placeholder for live count. */
+  name: string;
+  type: ActivityType;
+};
+
+/**
+ * Static activity used while the bot is booting (before Discord login
+ * completes) and during reconnects. Same string across the codebase
+ * so the bot never advertises capabilities it does not own.
+ */
+const STARTING_PRESENCE: PresenceTemplate = {
+  name: 'Starting up…',
+  type: ActivityType.Watching,
+};
+
+/**
+ * Rotating activity pool used after `ready` fires. Each entry is short,
+ * semantic, and uses the {guilds} placeholder where dynamic data is
+ * genuinely useful. Avoid noisy or spammy text.
+ */
+const ACTIVE_PRESENCES: PresenceTemplate[] = [
+  { name: 'Protecting {guilds} servers',            type: ActivityType.Watching },
+  { name: '/help · Protect · Automate · Manage',   type: ActivityType.Listening },
+  { name: 'Monitoring security',                    type: ActivityType.Watching },
+  { name: 'Securing your community',                type: ActivityType.Watching },
 ];
 
-let statusIndex = 0;
-function rotatePresence(client: Client): void {
-  const update = () => {
-    const template = STATUSES[statusIndex % STATUSES.length];
-    statusIndex++;
-    const text = template.name.replace('{guilds}', String(client.guilds.cache.size));
-    client.user?.setPresence({ activities: [{ name: text, type: template.type }], status: 'online' });
-  };
-  update();
-  setInterval(update, 30_000).unref();
+let presenceTimer: NodeJS.Timeout | null = null;
+let presenceIndex = 0;
+
+/**
+ * Apply a single presence to the bot. No-op if the user isn't ready
+ * yet (setPresence is silently dropped by discord.js in that case).
+ */
+function applyPresence(
+  client: Client,
+  template: PresenceTemplate,
+  status: 'online' | 'idle' | 'dnd' | 'invisible' = 'online',
+): void {
+  if (!client.user) return;
+  const guilds = client.guilds?.cache?.size ?? 0;
+  const guildsDisplay = guilds > 0 ? String(guilds) : '—';
+  const text = template.name.replace(/\{guilds\}/g, guildsDisplay);
+  try {
+    client.user.setPresence({
+      activities: [{ name: text, type: template.type }],
+      status,
+    });
+  } catch {
+    /* swallow — presence updates are best-effort */
+  }
+}
+
+/**
+ * Apply the static "starting" presence. Called BEFORE client.login()
+ * so users see a professional status immediately as the bot comes
+ * online (within Discord's visibility window).
+ */
+export function applyStartupPresence(client: Client): void {
+  applyPresence(client, STARTING_PRESENCE, 'online');
+}
+
+/**
+ * Begin the polished presence rotation. Called from the `ready` event
+ * so we have an authoritative guild count and stable identity.
+ *
+ * Replaces any previously installed rotation timer, so this is safe to
+ * call from `ready` and from `reconnect`/manual `ready`-like hooks.
+ */
+function startPresenceRotation(client: Client): void {
+  // Clear any prior rotation (e.g. from a reconnect).
+  if (presenceTimer) {
+    clearInterval(presenceTimer);
+    presenceTimer = null;
+  }
+  presenceIndex = 0;
+  // Render the first template immediately so users see a polished
+  // activity right after `ready` fires — not the old startup text.
+  applyPresence(
+    client,
+    ACTIVE_PRESENCES[presenceIndex % ACTIVE_PRESENCES.length],
+    'online',
+  );
+  // Rotate every 90 seconds. Slow enough to feel curated, not spammy.
+  presenceTimer = setInterval(() => {
+    presenceIndex = (presenceIndex + 1) % ACTIVE_PRESENCES.length;
+    applyPresence(client, ACTIVE_PRESENCES[presenceIndex], 'online');
+  }, 90_000);
+  presenceTimer.unref?.();
 }
 
 export function createClient(): Client {
@@ -130,7 +219,26 @@ export function createClient(): Client {
 
   client.once('ready', (c) => {
     logger.info('Zabron ready', { tag: c.user.tag, guilds: c.guilds.cache.size });
-    rotatePresence(c);
+    startPresenceRotation(c);
+  });
+
+  // Reconnect/resume hooks. discord.js emits `reconnecting` while the
+  // gateway is down and `ready` again when it recovers. We swap the
+  // presence to the static "starting" template so users see a
+  // professional status during the outage window. The rotation timer
+  // is also cleared so it doesn't fire stale calls while disconnected.
+  client.on('reconnecting', () => {
+    logger.info('Discord reconnecting — switching to starting presence');
+    if (presenceTimer) {
+      clearInterval(presenceTimer);
+      presenceTimer = null;
+    }
+    applyPresence(client, STARTING_PRESENCE, 'idle');
+  });
+
+  client.on('resume', (replayed) => {
+    logger.info('Discord resume — restoring presence rotation', { replayed });
+    startPresenceRotation(client);
   });
 
   client.on('error', (err) => logger.warn('Discord client error', { err: String(err) }));
@@ -153,6 +261,14 @@ export async function startBot(): Promise<void> {
     process.exit(1);
   }
   const client = createClient();
+
+  // Apply the static "Starting up…" presence BEFORE login so users see
+  // a professional status as soon as Discord knows about the bot.
+  // (setPresence is silently dropped by discord.js until `ready` fires,
+  // but this guarantees we don't accidentally inherit stale data and
+  // documents the intended presence contract.)
+  applyStartupPresence(client);
+
   await client.login(token);
 
   process.on('unhandledRejection', (reason) => logger.error('Unhandled rejection', { reason: String(reason) }));

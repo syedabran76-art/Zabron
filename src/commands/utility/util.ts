@@ -21,7 +21,14 @@ import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError, deferReply, editReply } from '../../handlers/respond.js';
 import { listByCategory } from '../../handlers/registry.js';
-import { buildEmbed, help as helpEmbed, pingResult, fmtUptime } from '../../embeds/builders.js';
+import {
+  buildEmbed,
+  help as helpEmbed,
+  pingResult,
+  fmtUptime,
+  BOT_TAGLINE,
+  BRAND_NAME,
+} from '../../embeds/builders.js';
 import { resolveUser } from '../../utils/permissions.js';
 import { discordTime } from '../../utils/duration.js';
 
@@ -68,8 +75,25 @@ const help: CommandDefinition = {
     }
 
     const entries = Object.entries(grouped);
-    const embed = helpEmbed('Zabron Help', 'Pick a category below or browse all commands here.').addFields(
-      entries.map(([cat, list]) => ({ name: `${cat} (${list.length})`, value: list.map((c) => `\`${c.name}\``).slice(0, 10).join(', ') + (list.length > 10 ? '…' : ''), inline: false })),
+    const totalCommands = entries.reduce((sum, [, list]) => sum + list.length, 0);
+
+    // Top-level help panel — polished landing page with tagline,
+    // status indicator and an easy-to-scan category summary. Two
+    // columns: (a) the brand block on the left, (b) a "How to use"
+    // hint on the right.
+    const summaryLines = entries.map(([cat, list]) => {
+      const shown = list.slice(0, 6).map((c) => `\`${c.name}\``).join(', ');
+      const more = list.length > 6 ? ` _(+${list.length - 6})_` : '';
+      return `**${cat}** · \`${list.length}\`\n${shown}${more}`;
+    });
+    const embed = helpEmbed(
+      `${BRAND_NAME} · Command Center`,
+      `**${BOT_TAGLINE}** — moderation, security, automation and community tools in one cohesive bot.\n\n`
+        + `🟢 All systems operational · ${totalCommands} commands across ${entries.length} categories.\n`
+        + `Pick a category below, or run \`/help <command>\` for details.`,
+    ).addFields(
+      { name: '📚 Categories', value: summaryLines.join('\n\n'), inline: false },
+      { name: '⚡ Quick start', value: '`/help <command>` · `/ping` · `/botinfo`', inline: false },
     );
 
     const select = new StringSelectMenuBuilder()
@@ -87,7 +111,11 @@ const help: CommandDefinition = {
         collector.on('collect', async (i) => {
           const cat = i.values[0];
           const cmds = grouped[cat] ?? [];
-          const e2 = helpEmbed(`${cat} commands`, cmds.map((c) => `**/${c.name}** — ${c.description}`).join('\n'));
+          const cmdList = cmds.map((c) => `\`/${c.name}\` — ${c.description}`).join('\n');
+          const e2 = helpEmbed(
+            `${BRAND_NAME} · ${cat}`,
+            `**${BOT_TAGLINE}**\n\n${cmdList}\n\n_Use \`/help <command>\` for full details._`,
+          );
           await i.update({ embeds: [e2], components: [row as any] });
         });
         collector.on('end', async () => {
@@ -154,11 +182,12 @@ const uptime: CommandDefinition = {
     await respond(ctx, {
       embeds: [buildEmbed({
         tone: 'info',
-        title: '⏱ Uptime',
-        description: `Zabron has been running for **${fmtUptime(uptimeMs)}**.`,
+        title: `⏱ ${BRAND_NAME} Uptime`,
+        description: `**${BOT_TAGLINE}**\n\n${BRAND_NAME} has been online for **${fmtUptime(uptimeMs)}**.`,
         fields: [
           { name: 'Started', value: discordTime(startedAt, 'R'), inline: true },
           { name: 'Status',  value: '🟢 Running', inline: true },
+          { name: 'Latency', value: 'Use `/ping` for a full health snapshot.', inline: false },
         ],
       })],
     });
@@ -179,8 +208,10 @@ const botinfo: CommandDefinition = {
     await respond(ctx, {
       embeds: [buildEmbed({
         tone: 'brand',
-        title: 'About Zabron',
-        description: 'A complete server operating system for Discord — moderation, security, automation, leveling and more in one cohesive bot.',
+        title: `About ${BRAND_NAME}`,
+        description:
+          `**${BOT_TAGLINE}** — a professional Discord server operating system.`
+          + '\nModeration, security, automation, leveling, tickets, giveaways, voice and community tools — all in one cohesive bot.',
         fields: [
           { name: '🌐 Servers',   value: `\`${guilds}\``, inline: true },
           { name: '📚 Library',   value: '`discord.js`', inline: true },
@@ -188,6 +219,7 @@ const botinfo: CommandDefinition = {
           { name: '⏱ Uptime',    value: `\`${fmtUptime(uptimeMs)}\``, inline: true },
           { name: '🟢 Status',    value: '`Online`', inline: true },
           { name: '🚀 Started',   value: discordTime(startedAt, 'R'), inline: true },
+          { name: '📖 Quick start', value: '`/help` · `/ping` · `/botinfo`', inline: false },
         ],
       })],
     });

@@ -1,7 +1,7 @@
 {
   "name": "zabron",
   "version": "1.0.0",
-  "description": "ZABRON — A professional all-in-one Discord bot and server-management platform.",
+  "description": "Zabron — Protect • Automate • Manage. A professional Discord server operating system: moderation, security, automation and community tools in one cohesive bot.",
   "main": "dist/index.js",
   "type": "commonjs",
   "scripts": {

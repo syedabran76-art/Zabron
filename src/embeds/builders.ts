@@ -34,7 +34,16 @@ import {
 // ============================================================================
 
 export const BRAND_NAME = 'Zabron';
-export const BRAND_TAGLINE = 'Server Operating System';
+/**
+ * Bot tagline / one-line elevator pitch. Used in footers, embeds and
+ * the bot's short description. Keep it short and capability-true.
+ */
+export const BOT_TAGLINE = 'Protect • Automate • Manage';
+/**
+ * Sub-tagline used in footer text — slightly more descriptive than
+ * BOT_TAGLINE. Always paired with the brand name in `buildEmbed`.
+ */
+export const BRAND_TAGLINE = 'Protect • Automate • Manage';
 export const BRAND_COLOR = 0x6c5ce7; // Primary brand purple
 
 // Semantic palette

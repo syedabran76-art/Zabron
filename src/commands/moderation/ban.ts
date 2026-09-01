@@ -18,7 +18,8 @@ import { parseDuration } from '../../utils/duration.js';
 import { caseId } from '../../utils/ids.js';
 import { insertModerationCase, insertTempBan, deleteTempBan } from '../../db/repositories.js';
 import { buildActorInfo, logEvent } from '../../services/logging.js';
-import { success } from '../../embeds/builders.js';
+import { moderationAction } from '../../embeds/builders.js';
+import { formatDuration } from '../../utils/duration.js';
 
 const def: CommandDefinition = {
   name: 'ban',
@@ -146,10 +147,17 @@ const def: CommandDefinition = {
 
     await respond(ctx, {
       embeds: [
-        success(
-          'Member banned',
-          `${user.tag} was banned.\n${reason ? `Reason: ${reason}` : 'No reason provided'}${durationMs ? `\nDuration: ${durationStr}` : ''}\nCase ID: ${id}`,
-        ),
+        moderationAction({
+          action: 'Member banned',
+          target: { id: user.id, tag: user.tag },
+          moderator: { id: ctx.user.id, tag: ctx.user.tag },
+          reason,
+          duration: durationMs ? formatDuration(durationMs) : null,
+          caseId: id,
+          extraFields: durationMs
+            ? [{ name: 'Temp ban', value: `Auto-unbans <t:${Math.floor((Date.now() + durationMs) / 1000)}:R>`, inline: true }]
+            : [{ name: 'Type', value: '⚫ Permanent', inline: true }],
+        }),
       ],
     });
 

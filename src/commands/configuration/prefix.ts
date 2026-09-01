@@ -8,7 +8,7 @@ import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond } from '../../handlers/respond.js';
 import { getGuildSettings, updateGuildSettings } from '../../db/repositories.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, configChange } from '../../embeds/builders.js';
 
 const def: CommandDefinition = {
   name: 'prefix',
@@ -46,19 +46,35 @@ const def: CommandDefinition = {
     const { sub, value } = ctx.args as any;
 
     if (sub === 'view') {
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'configuration', title: 'Current prefix', description: `Prefix is \`${settings.prefix}\`\nUse it like \`${settings.prefix}help\`` })] });
+      await respond(ctx, { embeds: [buildEmbed({
+        tone: 'configuration',
+        title: `⚙ Prefix — \`${settings.prefix}\``,
+        description: `Use it like \`${settings.prefix}help\` · Up to 5 characters allowed.`,
+      })] });
       return;
     }
     if (sub === 'reset') {
-      const next = updateGuildSettings(ctx.guild.id, { prefix: '.' });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Prefix reset', description: `New prefix: \`${next.prefix}\`` })] });
+      const before = settings.prefix;
+      updateGuildSettings(ctx.guild.id, { prefix: '.' });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Guild prefix',
+        previous: `\`${before}\``,
+        current: '`.\`',
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (sub === 'set') {
-      if (!value) { await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: 'Provide a prefix' })] }); return; }
-      if (value.length > 5) { await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: 'Prefix too long', description: 'Use up to 5 characters.' })] }); return; }
-      const next = updateGuildSettings(ctx.guild.id, { prefix: value });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Prefix updated', description: `New prefix: \`${next.prefix}\`` })] });
+      if (!value) { await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: '⚠ Provide a prefix' })] }); return; }
+      if (value.length > 5) { await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: '✗ Prefix too long', description: 'Use up to 5 characters.' })] }); return; }
+      const before = settings.prefix;
+      updateGuildSettings(ctx.guild.id, { prefix: value });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Guild prefix',
+        previous: `\`${before}\``,
+        current: `\`${value}\``,
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
     }
   },
 };

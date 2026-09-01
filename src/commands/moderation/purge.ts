@@ -9,7 +9,7 @@ import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError } from '../../handlers/respond.js';
 import { parseDuration } from '../../utils/duration.js';
 import { insertModerationCase } from '../../db/repositories.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { actionDone } from '../../embeds/builders.js';
 import { logEvent, buildActorInfo } from '../../services/logging.js';
 
 const def: CommandDefinition = {
@@ -86,12 +86,16 @@ const def: CommandDefinition = {
       metadata: JSON.stringify({ amount: deleted, filter }),
     });
 
+    const filterSummary = [
+  user ? `Target: <@${user.id}>` : null,
+  filter ? `Filter: \`${filter}\`` : null,
+].filter(Boolean).join(' · ');
     await respond(ctx, {
       embeds: [
-        buildEmbed({
-          tone: 'success',
-          title: 'Channel purged',
-          description: `Removed **${deleted}** message${deleted === 1 ? '' : 's'} from <#${ctx.channel.id}>.`,
+        actionDone({
+          action: 'Channel purged',
+          target: `<#${ctx.channel.id}>`,
+          detail: `Removed **${deleted}** message${deleted === 1 ? '' : 's'} from <#${ctx.channel.id}>${filterSummary ? `\n${filterSummary}` : ''}.`,
         }),
       ],
       ephemeral: ctx.source === 'slash',

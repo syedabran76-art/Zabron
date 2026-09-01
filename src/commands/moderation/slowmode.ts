@@ -8,7 +8,7 @@ import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError } from '../../handlers/respond.js';
 import { parseDuration } from '../../utils/duration.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { actionDone } from '../../embeds/builders.js';
 
 const def: CommandDefinition = {
   name: 'slowmode',
@@ -57,7 +57,11 @@ const def: CommandDefinition = {
     }
     await target.setRateLimitPerUser(seconds, `slowmode set by ${ctx.user.tag}`);
     await respond(ctx, {
-      embeds: [buildEmbed({ tone: 'success', title: 'Slowmode updated', description: seconds === 0 ? 'Slowmode disabled.' : `Slowmode set to **${seconds}s**.` })],
+      embeds: [actionDone({
+        action: 'Slowmode updated',
+        target: `<#${ctx.channel.id}>`,
+        detail: seconds === 0 ? 'Slowmode disabled.' : `Now **${seconds} second${seconds === 1 ? '' : 's'}** between messages.`,
+      })],
     });
   },
 };

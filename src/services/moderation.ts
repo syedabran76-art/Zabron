@@ -2,7 +2,8 @@
  * Zabron — Shared moderation helpers.
  *
  * Provides reusable functions so every moderation command does not
- * duplicate permission checks, hierarchy validation and case recording.
+ * duplicate permission checks, hierarchy validation, case recording and
+ * the polished user-facing embed.
  */
 
 import { Guild, GuildMember, User, PermissionResolvable } from 'discord.js';
@@ -10,9 +11,9 @@ import { Guild, GuildMember, User, PermissionResolvable } from 'discord.js';
 import { canActOn, hasBotPermissions, hasUserPermissions, resolveUser } from '../utils/permissions.js';
 import { insertModerationCase } from '../db/repositories.js';
 import { caseId } from '../utils/ids.js';
-import { replyError } from '../handlers/respond.js';
+import { replyError, respond } from '../handlers/respond.js';
 import { buildActorInfo, logEvent } from './logging.js';
-import { success } from '../embeds/builders.js';
+import { moderationAction } from '../embeds/builders.js';
 import type { CommandContext, ModerationAction } from '../types/index.js';
 
 export interface ModerationInput {
@@ -22,9 +23,17 @@ export interface ModerationInput {
   reason: string | null;
   durationMs: number | null;
   action: ModerationAction;
+  /** Human-readable duration string (e.g. "1 hour 30 minutes"). Optional. */
+  durationLabel?: string | null;
   extraFields?: { name: string; value: string; inline?: boolean }[];
   successTitle?: string;
   successDescription?: string;
+  /**
+   * Suppress the user-facing moderation embed — useful when the calling
+   * command has already composed its own reply (e.g. /warn with custom
+   * extra fields). Defaults to false (send embed).
+   */
+  silent?: boolean;
 }
 
 export interface ModerationResult {
@@ -72,14 +81,18 @@ export async function runModeration(
     metadata: null,
   });
 
-  if (ctx.channel && !('partial' in ctx.channel ? ctx.channel.partial : false) && 'send' in ctx.channel) {
-    await (ctx.channel as any).send({
+  if (!input.silent) {
+    await respond(ctx, {
       embeds: [
-        success(
-          input.successTitle ?? `${capitalize(input.action)} applied`,
-          input.successDescription ??
-            `${input.user.tag} — case ${id}` + (input.reason ? `\nReason: ${input.reason}` : ''),
-        ),
+        moderationAction({
+          action: input.successTitle ?? `${capitalize(input.action)} applied`,
+          target: { id: input.user.id, tag: input.user.tag },
+          moderator: { id: input.executor.id, tag: input.executor.user.tag },
+          reason: input.reason,
+          duration: input.durationLabel,
+          caseId: id,
+          extraFields: input.extraFields?.map((f) => ({ ...f, inline: f.inline ?? false })),
+        }),
       ],
     });
   }

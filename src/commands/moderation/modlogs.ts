@@ -9,7 +9,7 @@ import { registerCommand } from '../../handlers/registry.js';
 import { respond } from '../../handlers/respond.js';
 import { listCasesForGuild, listCasesForUser, getCase } from '../../db/repositories.js';
 import { resolveUser } from '../../utils/permissions.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, listResult, emptyState } from '../../embeds/builders.js';
 import { discordTime } from '../../utils/duration.js';
 
 const def: CommandDefinition = {
@@ -46,21 +46,26 @@ const def: CommandDefinition = {
       : listCasesForGuild(ctx.guild.id, limit);
 
     if (!list.length) {
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'No cases', description: 'No moderation history found.' })] });
+      await respond(ctx, { embeds: [emptyState({
+        title: user ? `📋 ${user.tag} — clean record` : '📋 No server cases',
+        message: user
+          ? `${user.tag} has no moderation history on this server.`
+          : 'No moderation actions have been recorded yet.',
+        tone: 'moderation',
+      })] });
       return;
     }
 
-    const embed = buildEmbed({
+    const items = list.map((c) =>
+      `\`${c.id}\` — **${c.action.toUpperCase()}** · <@${c.targetId}> · ${discordTime(c.createdAt, 'R')}\nReason: ${c.reason ?? '_None_'}`
+    );
+    await respond(ctx, { embeds: [listResult({
+      title: user ? `📋 Cases — ${user.tag}` : '📋 Server cases',
+      items,
+      summary: `${list.length} case${list.length === 1 ? '' : 's'} shown (max ${limit}).`,
+      perPage: 10,
       tone: 'moderation',
-      title: user ? `Cases — ${user.tag}` : 'Server cases',
-      description: `${list.length} case${list.length === 1 ? '' : 's'} shown.`,
-      fields: list.map((c) => ({
-        name: `${c.id} • ${c.action.toUpperCase()}`,
-        value: `<@${c.targetId}> • ${discordTime(c.createdAt, 'R')}\nReason: ${c.reason ?? 'None'}`,
-        inline: false as const,
-      })),
-    });
-    await respond(ctx, { embeds: [embed] });
+    })] });
   },
 };
 

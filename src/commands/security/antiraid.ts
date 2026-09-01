@@ -7,7 +7,7 @@ import { ChatInputCommandInteraction, Message, PermissionFlagsBits, SlashCommand
 import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond } from '../../handlers/respond.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, configChange, actionDone } from '../../embeds/builders.js';
 import { getAntiraidConfig, setAntiraidConfig } from '../../services/security.js';
 
 const def: CommandDefinition = {
@@ -49,27 +49,75 @@ const def: CommandDefinition = {
     const args = ctx.args as any;
     const config = getAntiraidConfig(ctx.guild.id);
     if (args.sub === 'status') {
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'security', title: 'Antiraid status', description: `Enabled: **${config.enabled}**`, fields: [
-        { name: 'Threshold', value: `${config.joinThreshold} joins / ${config.joinWindowSeconds}s`, inline: true },
-        { name: 'Account age', value: `${config.accountAgeDays} days`, inline: true },
-        { name: 'Action', value: config.action, inline: true },
-      ] })] });
+      await respond(ctx, {
+        embeds: [buildEmbed({
+          tone: 'security',
+          title: `🛡 Antiraid — ${config.enabled ? '🟢 Enabled' : '🔴 Disabled'}`,
+          description: `Reacts to **${config.action}** when raid conditions are met.`,
+          fields: [
+            { name: 'Join threshold', value: `\`${config.joinThreshold}\` joins / \`${config.joinWindowSeconds}s\``, inline: true },
+            { name: 'Account age',    value: `\`${config.accountAgeDays}\` days`, inline: true },
+            { name: 'Action',         value: `\`${config.action}\``, inline: true },
+          ],
+        })],
+      });
       return;
     }
-    if (args.sub === 'enable') { setAntiraidConfig(ctx.guild.id, { enabled: true }); await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Antiraid enabled' })] }); return; }
-    if (args.sub === 'disable') { setAntiraidConfig(ctx.guild.id, { enabled: false }); await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Antiraid disabled' })] }); return; }
+    if (args.sub === 'enable') {
+      const previous = config.enabled;
+      setAntiraidConfig(ctx.guild.id, { enabled: true });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Antiraid',
+        previous: previous ? '🟢 Enabled' : '🔴 Disabled',
+        current: '🟢 Enabled',
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
+      return;
+    }
+    if (args.sub === 'disable') {
+      const previous = config.enabled;
+      setAntiraidConfig(ctx.guild.id, { enabled: false });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Antiraid',
+        previous: previous ? '🟢 Enabled' : '🔴 Disabled',
+        current: '🔴 Disabled',
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
+      return;
+    }
     if (args.sub === 'threshold') {
+      const before = {
+        joins: config.joinThreshold,
+        window: config.joinWindowSeconds,
+        accountAge: config.accountAgeDays,
+      };
       const patch: any = {};
       if (args.joins) patch.joinThreshold = args.joins;
       if (args.window) patch.joinWindowSeconds = args.window;
       if (args.accountAge !== null && args.accountAge !== undefined) patch.accountAgeDays = args.accountAge;
       setAntiraidConfig(ctx.guild.id, patch);
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Thresholds updated' })] });
+      const after = { ...before, ...patch };
+      const summary = [
+        `Joins: \`${before.joins}\` → \`${after.joinThreshold}\``,
+        `Window: \`${before.window}s\` → \`${after.joinWindowSeconds}s\``,
+        `Account age: \`${before.accountAge}d\` → \`${after.accountAgeDays}d\``,
+      ].join('\n');
+      await respond(ctx, { embeds: [actionDone({
+        action: 'Antiraid thresholds updated',
+        target: ctx.guild.name,
+        detail: summary,
+      })] });
       return;
     }
     if (args.sub === 'action') {
+      const before = config.action;
       setAntiraidConfig(ctx.guild.id, { action: args.action });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Action updated', description: `Action: ${args.action}` })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Antiraid action',
+        previous: `\`${before}\``,
+        current: `\`${args.action}\``,
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
     }
   },
 };

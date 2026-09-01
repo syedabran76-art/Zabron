@@ -9,7 +9,7 @@ import { registerCommand } from '../../handlers/registry.js';
 import { resolveUser } from '../../utils/permissions.js';
 import { listWarnings, clearWarnings } from '../../db/repositories.js';
 import { replyError, respond } from '../../handlers/respond.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, listResult, emptyState } from '../../embeds/builders.js';
 import { discordTime } from '../../utils/duration.js';
 
 const def: CommandDefinition = {
@@ -43,25 +43,32 @@ const def: CommandDefinition = {
     const { user, clear } = ctx.args as any;
     if (clear) {
       clearWarnings(ctx.guild.id, user.id);
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Warnings cleared', description: `All warnings for ${user.tag} were removed.` })] });
+      await respond(ctx, { embeds: [buildEmbed({
+        tone: 'success',
+        title: '✓ Warnings cleared',
+        description: `All warnings for ${user.tag} have been wiped.`,
+      })] });
       return;
     }
     const list = listWarnings(ctx.guild.id, user.id);
     if (!list.length) {
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'No warnings', description: `${user.tag} has a clean record.` })] });
+      await respond(ctx, { embeds: [emptyState({
+        title: `🟢 ${user.tag} — clean record`,
+        message: `${user.tag} has no warnings on this server.`,
+        tone: 'success',
+      })] });
       return;
     }
-    const embed = buildEmbed({
+    const items = list.slice(0, 10).map((w, idx) =>
+      `**${idx + 1}.** ${w.reason ?? '_No reason given_'} · ${discordTime(w.createdAt, 'R')} · by <@${w.moderatorId}>`
+    );
+    await respond(ctx, { embeds: [listResult({
+      title: `⚠ Warnings — ${user.tag}`,
+      items,
+      summary: `Total on record: **${list.length}**.`,
+      perPage: 10,
       tone: 'moderation',
-      title: `Warnings — ${user.tag}`,
-      description: `${list.length} warning${list.length === 1 ? '' : 's'} on record.`,
-      fields: list.slice(0, 10).map((w, idx) => ({
-        name: `#${idx + 1} • ${discordTime(w.createdAt, 'R')}`,
-        value: `${w.reason ?? 'No reason'}\nIssued by <@${w.moderatorId}>`,
-        inline: false,
-      })),
-    });
-    await respond(ctx, { embeds: [embed] });
+    })] });
   },
 };
 

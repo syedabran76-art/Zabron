@@ -7,7 +7,7 @@ import { ChatInputCommandInteraction, Message, SlashCommandBuilder, PermissionFl
 import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError, replySuccess } from '../../handlers/respond.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, afkStatus as afkStatusEmbed, listResult, emptyState, actionDone, truncate } from '../../embeds/builders.js';
 import { resolveUser } from '../../utils/permissions.js';
 import { parseDuration, discordTime } from '../../utils/duration.js';
 import { randomToken, eventId } from '../../utils/ids.js';
@@ -46,8 +46,19 @@ const afk: CommandDefinition = {
   async run(ctx: CommandContext) {
     if (!ctx.guild) return;
     const { reason } = ctx.args as any;
+    const since = Date.now();
     setAfk(ctx.guild.id, ctx.user.id, reason);
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'AFK set', description: reason ? `Reason: ${reason}` : 'You are now AFK.' })] });
+    await respond(ctx, {
+      embeds: [
+        afkStatusEmbed({
+          enabled: true,
+          user: { id: ctx.user.id, tag: ctx.user.tag },
+          reason,
+          since,
+          view: false,
+        }),
+      ],
+    });
   },
 };
 
@@ -68,8 +79,29 @@ const afkStatus: CommandDefinition = {
     if (!ctx.guild) return;
     const { user } = ctx.args as any;
     const a = getAfk(ctx.guild.id, user.id);
-    if (!a) { await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Not AFK' })] }); return; }
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: `${user.tag} is AFK`, description: `Since ${discordTime(a.since, 'R')}\nReason: ${a.reason ?? 'No reason'}` })] });
+    if (!a) {
+      await respond(ctx, {
+        embeds: [
+          afkStatusEmbed({
+            enabled: false,
+            user: { id: user.id, tag: user.tag },
+            view: true,
+          }),
+        ],
+      });
+      return;
+    }
+    await respond(ctx, {
+      embeds: [
+        afkStatusEmbed({
+          enabled: true,
+          user: { id: user.id, tag: user.tag },
+          reason: a.reason,
+          since: a.since,
+          view: true,
+        }),
+      ],
+    });
   },
 };
 
@@ -106,8 +138,17 @@ const reminders: CommandDefinition = {
   parsePrefix() { return {}; },
   async run(ctx: CommandContext) {
     const list = listReminders(ctx.user.id);
-    if (!list.length) { await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'No reminders' })] }); return; }
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Your reminders', description: list.map((r) => `• ${r.id} — ${r.message} (${discordTime(r.remindAt, 'R')})`).join('\n') }) ] });
+    const items = list.map((r) => `\`${r.id}\` — ${r.message} *(fires ${discordTime(r.remindAt, 'R')})*`);
+    await respond(ctx, {
+      embeds: [
+        listResult({
+          title: '⏰ Your reminders',
+          items,
+          summary: 'Pending reminders set in this guild.',
+          tone: 'info',
+        }),
+      ],
+    });
   },
 };
 
@@ -167,7 +208,17 @@ const sticky: CommandDefinition = {
       return;
     }
     const list = listStickyMessages(ctx.guild.id);
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Sticky messages', description: list.map((s) => `<#${s.channelId}> — ${s.content.slice(0, 60)}`).join('\n') || 'No stickies.' }) ] });
+    const items = list.map((s) => `<#${s.channelId}> — ${s.content.slice(0, 80)}`);
+    await respond(ctx, {
+      embeds: [
+        listResult({
+          title: '📌 Sticky messages',
+          items,
+          summary: 'Channels with an active sticky message.',
+          tone: 'info',
+        }),
+      ],
+    });
   },
 };
 
@@ -216,7 +267,17 @@ const customCommand: CommandDefinition = {
       return;
     }
     const list = listCustomCommands(ctx.guild.id);
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Custom commands', description: list.map((c) => `\`${c.name}\` — ${c.response.slice(0, 60)}`).join('\n') || 'None.' }) ] });
+    const items = list.map((c) => `\`${c.name}\` — ${c.response.slice(0, 80)}${c.embed ? ' *\(embed\)*' : ''}`);
+    await respond(ctx, {
+      embeds: [
+        listResult({
+          title: '⌨️ Custom commands',
+          items,
+          summary: 'Custom slash/prefix commands defined in this guild.',
+          tone: 'info',
+        }),
+      ],
+    });
   },
 };
 
@@ -270,16 +331,42 @@ const autoresponder: CommandDefinition = {
         enabled: true,
         createdAt: Date.now(),
       });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Autoresponder added' })] });
+      await respond(ctx, {
+        embeds: [
+          actionDone({
+            action: 'Autoresponder added',
+            target: `\`${args.name.toLowerCase()}\``,
+            detail: `Triggers when a message \`${args.match}\` matches **${args.trigger}**.`,
+          }),
+        ],
+      });
       return;
     }
     if (args.sub === 'remove') {
-      if (deleteAutoresponder(ctx.guild.id, args.name)) await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Removed' })] });
-      else await replyError(ctx, 'Not found.');
+      if (deleteAutoresponder(ctx.guild.id, args.name)) {
+        await respond(ctx, {
+          embeds: [actionDone({ action: 'Autoresponder removed', target: `\`${args.name}\`` })],
+        });
+      } else await replyError(ctx, 'No autoresponder with that name.');
       return;
     }
+    // List — listResult gives us a polished dashboard with summary + count.
     const list = listAutoresponders(ctx.guild.id);
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Autoresponders', description: list.map((a) => `\`${a.name}\` (${a.match}) — ${a.trigger}`).join('\n') || 'None.' }) ] });
+    const summary = 'Auto-reply rules that trigger when a message matches a configured pattern.';
+    const items = list.map((a, idx) =>
+      `**${idx + 1}.** \`${a.name}\` — match: \`${a.match}\` · trigger: **${a.trigger}** · reply: ${truncate(a.response, 90)}`
+    );
+    await respond(ctx, {
+      embeds: [
+        listResult({
+          title: '🤖 Autoresponders',
+          items,
+          summary,
+          perPage: 10,
+          tone: 'community',
+        }),
+      ],
+    });
   },
 };
 

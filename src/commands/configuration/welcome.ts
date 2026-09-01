@@ -8,7 +8,7 @@ import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond } from '../../handlers/respond.js';
 import { getDatabase } from '../../db/database.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, configChange, actionDone, emptyState } from '../../embeds/builders.js';
 
 interface WelcomeRow {
   welcome_channel: string | null;
@@ -75,43 +75,92 @@ const welcome: CommandDefinition = {
     const args = ctx.args as any;
     const config = getWelcomeConfig(ctx.guild.id);
     if (args.sub === 'status') {
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'configuration', title: 'Welcome config', fields: [
+      const fields = [
         { name: 'Channel', value: config.welcome_channel ? `<#${config.welcome_channel}>` : '—', inline: true },
-        { name: 'Message', value: config.welcome_message ?? '—', inline: false },
-        { name: 'DM', value: config.welcome_dm ?? '—', inline: false },
         { name: 'Autorole', value: config.welcome_role ? `<@&${config.welcome_role}>` : '—', inline: true },
-      ] })] });
+        { name: 'Welcome DM', value: config.welcome_dm ? '🟢 Configured' : '—', inline: true },
+      ];
+      const hasMessage = !!config.welcome_message;
+      await respond(ctx, {
+        embeds: [buildEmbed({
+          tone: 'configuration',
+          title: `⚙ Welcome — ${config.welcome_channel ? '🟢 Enabled' : '🔴 Disabled'}`,
+          description: hasMessage ? 'Current message template (variables supported: `{mention}`, `{username}`, `{server}`).' : 'No welcome message configured yet.',
+          fields: hasMessage
+            ? [...fields, { name: 'Message', value: `\`\`\`\n${config.welcome_message}\n\`\`\``, inline: false }]
+            : [...fields, ...(config.welcome_dm ? [{ name: 'DM Message', value: `\`\`\`\n${config.welcome_dm}\n\`\`\``, inline: false }] : [])],
+        })],
+      });
       return;
     }
     if (args.sub === 'enable') {
       if (!args.channel) return;
+      const before = config.welcome_channel;
       setWelcomeConfig(ctx.guild.id, { welcome_channel: args.channel.id });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Welcome enabled', description: `Channel: <#${args.channel.id}>` })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Welcome channel',
+        previous: before ? `<#${before}>` : '`none`',
+        current: `<#${args.channel.id}>`,
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (args.sub === 'disable') {
+      const before = config.welcome_channel;
       setWelcomeConfig(ctx.guild.id, { welcome_channel: null });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Welcome disabled' })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Welcome channel',
+        previous: before ? `<#${before}>` : '`none`',
+        current: '`none` (disabled)',
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (args.sub === 'message') {
       setWelcomeConfig(ctx.guild.id, { welcome_message: args.text });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Welcome message updated' })] });
+      await respond(ctx, { embeds: [actionDone({
+        action: 'Welcome message updated',
+        target: ctx.guild.name,
+        detail: `New template: \`${args.text ?? '(empty)'}\``,
+      })] });
       return;
     }
     if (args.sub === 'dm') {
       setWelcomeConfig(ctx.guild.id, { welcome_dm: args.text });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'DM message updated' })] });
+      await respond(ctx, { embeds: [actionDone({
+        action: 'Welcome DM updated',
+        target: ctx.guild.name,
+        detail: args.text ? 'New DM template saved.' : 'Welcome DM cleared.',
+      })] });
       return;
     }
     if (args.sub === 'autorole') {
       if (!args.role) return;
+      const before = config.welcome_role;
       setWelcomeConfig(ctx.guild.id, { welcome_role: args.role.id });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Autorole set', description: `<@&${args.role.id}>` })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Welcome autorole',
+        previous: before ? `<@&${before}>` : '`none`',
+        current: `<@&${args.role.id}>`,
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (args.sub === 'test') {
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'welcome', title: 'Welcome test', description: config.welcome_message ?? 'Welcome {mention} to {server}!' })] });
+      if (!config.welcome_message) {
+        await respond(ctx, { embeds: [emptyState({
+          title: '🧪 Welcome test — no template',
+          message: 'No welcome message is set. Configure one with `/welcome message` first.',
+          tone: 'welcome',
+        })] });
+        return;
+      }
+      await respond(ctx, { embeds: [buildEmbed({
+        tone: 'welcome',
+        title: '🧪 Welcome message preview',
+        description: config.welcome_message,
+        footer: 'Variables will be substituted at send time',
+      })] });
     }
   },
 };
@@ -144,21 +193,46 @@ const goodbye: CommandDefinition = {
     const config = getWelcomeConfig(ctx.guild.id);
     if (args.sub === 'enable') {
       if (!args.channel) return;
+      const before = config.goodbye_channel;
       setWelcomeConfig(ctx.guild.id, { goodbye_channel: args.channel.id });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Goodbye enabled' })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Goodbye channel',
+        previous: before ? `<#${before}>` : '`none`',
+        current: `<#${args.channel.id}>`,
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (args.sub === 'disable') {
+      const before = config.goodbye_channel;
       setWelcomeConfig(ctx.guild.id, { goodbye_channel: null });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Goodbye disabled' })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Goodbye channel',
+        previous: before ? `<#${before}>` : '`none`',
+        current: '`none` (disabled)',
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (args.sub === 'message') {
       setWelcomeConfig(ctx.guild.id, { goodbye_message: args.text });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Goodbye message updated' })] });
+      await respond(ctx, { embeds: [actionDone({
+        action: 'Goodbye message updated',
+        target: ctx.guild.name,
+        detail: `New template: \`${args.text ?? '(empty)'}\``,
+      })] });
       return;
     }
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'configuration', title: 'Goodbye config', description: `Channel: ${config.goodbye_channel ? `<#${config.goodbye_channel}>` : '—'}\nMessage: ${config.goodbye_message ?? '—'}` })] });
+    await respond(ctx, {
+      embeds: [buildEmbed({
+        tone: 'configuration',
+        title: `⚙ Goodbye — ${config.goodbye_channel ? '🟢 Enabled' : '🔴 Disabled'}`,
+        fields: [
+          { name: 'Channel', value: config.goodbye_channel ? `<#${config.goodbye_channel}>` : '—', inline: true },
+          { name: 'Message', value: config.goodbye_message ? `\`\`\`\n${config.goodbye_message}\n\`\`\`` : '—', inline: false },
+        ],
+      })],
+    });
   },
 };
 
@@ -187,13 +261,24 @@ const autorole: CommandDefinition = {
   async run(ctx: CommandContext) {
     if (!ctx.guild) return;
     const args = ctx.args as any;
+    const before = getWelcomeConfig(ctx.guild.id).autorole;
     if (args.sub === 'set') {
       if (!args.role) return;
       setWelcomeConfig(ctx.guild.id, { autorole: args.role.id });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Autorole set', description: `<@&${args.role.id}>` })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Autorole',
+        previous: before ? `<@&${before}>` : '`none`',
+        current: `<@&${args.role.id}>`,
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
     } else {
       setWelcomeConfig(ctx.guild.id, { autorole: null });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Autorole cleared' })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Autorole',
+        previous: before ? `<@&${before}>` : '`none`',
+        current: '`none` (cleared)',
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
     }
   },
 };

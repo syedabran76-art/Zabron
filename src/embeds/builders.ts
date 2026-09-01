@@ -375,6 +375,42 @@ export function fmtDuration(ms: number): string {
   return parts.join(' ');
 }
 
+/**
+ * Format a millisecond uptime into a compact "Nd Nh Nm" string suitable
+ * for status dashboard displays.
+ */
+export function fmtUptime(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '—';
+  return fmtDuration(ms);
+}
+
+/**
+ * Compose a status dashboard row for `WebSocket / Uptime / Memory / Guilds`.
+ * Returns the array of fields used by `pingResult()`.
+ *
+ * Every metric is rendered with a semantic status indicator. Negative or
+ * non-finite latency values are NEVER shown as raw numbers — they become
+ * `—` so the user never sees `-1ms`.
+ */
+export interface PingMetrics {
+  wsLatency: number;
+  uptimeMs:  number;
+  memoryMB:  number;
+  guildCount: number;
+}
+
+export function pingFields(metrics: PingMetrics): EmbedField[] {
+  const ws = fmtLatency(metrics.wsLatency);
+  const mem = fmtMemory(metrics.memoryMB);
+  const guildKnown = Number.isFinite(metrics.guildCount) && metrics.guildCount >= 0;
+  return [
+    { name: '💓 WebSocket', value: `${STATUS_INDICATOR[ws.status]} \`${ws.display}\``, inline: true },
+    { name: '⏱ Uptime',    value: `\`${fmtUptime(metrics.uptimeMs)}\``, inline: true },
+    { name: '💾 Memory',    value: `${STATUS_INDICATOR[mem.status]} \`${mem.display}\``, inline: true },
+    { name: '🌐 Servers',   value: guildKnown ? `\`${metrics.guildCount}\`` : '`—`', inline: true },
+  ];
+}
+
 // ============================================================================
 // SPECIALIZED BUILDERS
 // ============================================================================
@@ -411,6 +447,10 @@ export function moderationAction(opts: {
   reason?:     string | null;
   duration?:   string | null;
   caseId:      string;
+  /** Extra fields appended to the embed (e.g. "Total warnings: 3"). */
+  extraFields?: EmbedField[];
+  /** Optional description override. Defaults to "<@target> <action>." */
+  description?: string;
 }): EmbedBuilder {
   const fields: EmbedField[] = [
     { name: 'Action',    value: opts.action,                              inline: true },
@@ -424,10 +464,13 @@ export function moderationAction(opts: {
     fields.push({ name: 'Duration', value: opts.duration, inline: true });
   }
   fields.push({ name: 'Case', value: `\`${opts.caseId}\``, inline: true });
+  if (opts.extraFields?.length) {
+    fields.push(...opts.extraFields);
+  }
 
   return buildEmbed({
     title: opts.action,
-    description: `${mentionUser(opts.target)} ${opts.action.toLowerCase()}d.`,
+    description: opts.description ?? `${mentionUser(opts.target)} ${opts.action.toLowerCase()}d.`,
     fields,
     tone: 'moderation',
     timestamp: Date.now(),
@@ -535,30 +578,221 @@ export function actionDone(opts: {
 }
 
 /**
+ * Format a WebSocket latency (ms) into a safe display value.
+ *
+ * Discord.js returns -1 when the heartbeat is unavailable, and may also
+ * return `NaN` or extremely large numbers. We never surface those values
+ * directly — we represent them as `—` and mark the status unknown.
+ */
+export function fmtLatency(ms: number): { display: string; known: boolean; status: StatusLevel } {
+  if (!Number.isFinite(ms) || ms < 0) {
+    return { display: '—', known: false, status: 'unknown' };
+  }
+  const rounded = Math.round(ms);
+  return { display: `${rounded}ms`, known: true, status: wsStatus(rounded) };
+}
+
+/**
+ * Format a memory usage in MB into a safe display value.
+ */
+export function fmtMemory(mb: number): { display: string; status: StatusLevel } {
+  if (!Number.isFinite(mb) || mb < 0) {
+    return { display: '—', status: 'unknown' as StatusLevel };
+  }
+  const rounded = Math.round(mb);
+  return { display: `${rounded}MB`, status: memoryStatus(rounded) };
+}
+
+/**
+ * Compute the overall system health from the individual subsystem
+ * statuses. A single `blocked` subsystem degrades the whole system.
+ */
+function aggregateStatus(...statuses: StatusLevel[]): StatusLevel {
+  if (statuses.includes('blocked'))  return 'blocked';
+  if (statuses.includes('degraded')) return 'degraded';
+  if (statuses.includes('unknown') && statuses.length > 1) return 'degraded';
+  if (statuses.every((s) => s === 'unknown')) return 'unknown';
+  return 'healthy';
+}
+
+/**
  * Ping / diagnostic embed with semantic status indicators.
+ *
+ * Acts as a polished status dashboard: it never displays a negative or
+ * unavailable latency as `-1ms`. Any unavailable metric is rendered as
+ * `—` and the overall status badge is computed from the individual
+ * subsystems.
+ *
+ * Layout:
+ *   - Title:   "🏓 Pong {indicator} {HealthLabel}"
+ *   - Desc:    one-line health snapshot + per-subsystem status list
+ *   - Fields:  WebSocket / Uptime / Memory / Servers
+ *   - Footer:  eventId / brand (centralized)
+ *
+ * Two call signatures are supported:
+ *   - Legacy: `uptime` as a pre-formatted string.
+ *   - Preferred: `uptimeMs` so formatting stays centralized.
  */
 export function pingResult(opts: {
-  wsLatency:     number;
-  uptime:        string;
-  memoryMB:      number;
-  guildCount:    number;
-}): EmbedBuilder {
-  const ws = wsStatus(opts.wsLatency);
-  const mem = memoryStatus(opts.memoryMB);
+  wsLatency:  number;
+  uptime:     string;
+  memoryMB:   number;
+  guildCount: number;
+}): EmbedBuilder;
+export function pingResult(opts: {
+  wsLatency:  number;
+  uptimeMs:   number;
+  memoryMB:   number;
+  guildCount: number;
+}): EmbedBuilder;
+export function pingResult(opts: any): EmbedBuilder {
+  const uptimeMs: number = typeof opts.uptimeMs === 'number'
+    ? opts.uptimeMs
+    : Number.isFinite(opts.uptime)
+      ? Number(opts.uptime)
+      : 0;
+  const metrics: PingMetrics = {
+    wsLatency: opts.wsLatency,
+    uptimeMs,
+    memoryMB: opts.memoryMB,
+    guildCount: opts.guildCount,
+  };
+  const ws = fmtLatency(metrics.wsLatency);
+  const mem = fmtMemory(metrics.memoryMB);
+  const overall = aggregateStatus(ws.status, mem.status);
+  const overallEmoji = STATUS_INDICATOR[overall];
+  const overallLabel = overall.charAt(0).toUpperCase() + overall.slice(1);
 
-  const fields: EmbedField[] = [
-    { name: '💓 WebSocket', value: `\`${opts.wsLatency}ms\` — ${STATUS_INDICATOR[ws]} ${ws}`, inline: true },
-    { name: '⏱ Uptime',    value: opts.uptime, inline: true },
-    { name: '💾 Memory',    value: `\`${opts.memoryMB}MB\` — ${STATUS_INDICATOR[mem]} ${mem}`, inline: true },
-    { name: '🌐 Servers',  value: String(opts.guildCount), inline: true },
-  ];
+  const fields = pingFields(metrics);
+
+  // Inline subsystem summary — keeps users informed at a glance without
+  // duplicating the indicator on every row.
+  const subParts: string[] = [];
+  subParts.push(`${STATUS_INDICATOR[ws.status]} **WebSocket** — ${ws.status === 'unknown' ? 'awaiting heartbeat' : ws.display}`);
+  subParts.push(`${STATUS_INDICATOR[mem.status]} **Memory** — ${mem.display}`);
+  subParts.push(`${overallEmoji} **System** — ${overallLabel}`);
+
+  const description =
+    overall === 'healthy'  ? 'All systems operational.' :
+    overall === 'degraded' ? 'Some subsystems are degraded.' :
+    overall === 'blocked'  ? 'At least one subsystem is blocked.' :
+                             'Status unavailable.';
+
+  const tone: EmbedTone =
+    overall === 'healthy' ? 'success' :
+    overall === 'degraded' ? 'warning' :
+    overall === 'blocked'  ? 'error'   :
+                             'system';
 
   return buildEmbed({
-    title: '🏓 Pong',
-    description: `All systems operational.`,
+    title: `🏓 Pong — ${overallEmoji} ${overallLabel}`,
+    description: `${description}\n${subParts.join('  ·  ')}`,
     fields,
-    tone: ws === 'blocked' ? 'warning' : ws === 'degraded' ? 'warning' : 'success',
+    tone,
     timestamp: Date.now(),
+  });
+}
+
+// ============================================================================
+// ACTION / AFK SPECIALIZED BUILDERS
+// ============================================================================
+
+/**
+ * Build an AFK-state change embed.
+ *
+ * Tells the user (or other server members) that AFK mode was enabled
+ * with a specific reason, and displays when it was activated.
+ */
+export function afkStatus(opts: {
+  enabled:    boolean;
+  user:       { id: string; tag: string };
+  reason?:    string | null;
+  since?:     number;
+  /** When true the embed is rendered as a "viewing someone else's AFK" panel. */
+  view?: boolean;
+}): EmbedBuilder {
+  if (!opts.enabled) {
+    const isView = !!opts.view;
+    return buildEmbed({
+      title: isView ? '🟢 User is active' : '🟢 AFK cleared',
+      description: isView
+        ? `${mentionUser(opts.user)} is currently active.`
+        : `${mentionUser(opts.user)} is back.`,
+      fields: [
+        { name: 'State', value: '🟢 Active', inline: true },
+      ],
+      tone: 'success',
+    });
+  }
+  const sinceUnix = Math.floor((opts.since ?? Date.now()) / 1000);
+  const fields: EmbedField[] = [
+    { name: 'State',  value: opts.view ? '🌙 AFK' : '🌙 AFK enabled', inline: true },
+    { name: 'Since',  value: `<t:${sinceUnix}:R>`, inline: true },
+    { name: 'Reason', value: opts.reason?.trim() ? truncate(opts.reason, 1024) : '*No reason given*', inline: false },
+  ];
+  return buildEmbed({
+    title: opts.view ? `${opts.user.tag} is AFK` : '🌙 AFK enabled',
+    description: opts.view
+      ? `${mentionUser(opts.user)} has been away since <t:${sinceUnix}:R>.`
+      : `${mentionUser(opts.user)} is now away. You'll be pinged when they return.`,
+    fields,
+    tone: 'info',
+    timestamp: opts.since ?? Date.now(),
+  });
+}
+
+/**
+ * Build a "no results / empty state" embed that can be used by any list
+ * command. The embed clearly explains *why* it's empty and what the
+ * user can do to populate it.
+ */
+export function emptyState(opts: {
+  title:   string;
+  message: string;
+  tone?:   EmbedTone;
+}): EmbedBuilder {
+  return buildEmbed({
+    title: opts.title,
+    description: opts.message,
+    fields: [
+      { name: 'Status', value: '⚪ Empty', inline: true },
+      { name: 'Count',  value: '`0`',     inline: true },
+    ],
+    tone: opts.tone ?? 'info',
+  });
+}
+
+/**
+ * Build a "list with header summary" embed. Suitable for any command
+ * that returns N items + a count + a short empty-state fall-back.
+ *
+ * `items` is rendered through `paginateList()` and shown alongside a
+ * summary block (total count + filter description). When `items.length
+ * === 0` the embed becomes an empty-state.
+ */
+export function listResult(opts: {
+  title:     string;
+  items:     string[];
+  summary?:  string;
+  perPage?:  number;
+  tone?:     EmbedTone;
+}): EmbedBuilder {
+  const tone = opts.tone ?? 'info';
+  const count = opts.items.length;
+  if (count === 0) {
+    return emptyState({
+      title: opts.title,
+      message: opts.summary ? `${opts.summary}\n\nThere are no entries to display.` : 'There are no entries to display.',
+      tone,
+    });
+  }
+  const fields: EmbedField[] = paginateList(opts.items, { title: opts.title, perPage: opts.perPage ?? 10 });
+  // Replace the first field's name with "Count" → "Items (N)" pattern.
+  const header: EmbedField = { name: '📋 Summary', value: opts.summary ? `${opts.summary}\n**Count:** \`${count}\`` : `**Count:** \`${count}\``, inline: false };
+  return buildEmbed({
+    title: opts.title,
+    fields: [header, ...fields],
+    tone,
   });
 }
 

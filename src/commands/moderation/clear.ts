@@ -7,7 +7,7 @@ import { ChatInputCommandInteraction, Message, PermissionFlagsBits, SlashCommand
 import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError } from '../../handlers/respond.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { actionDone } from '../../embeds/builders.js';
 
 const def: CommandDefinition = {
   name: 'clear',
@@ -44,7 +44,13 @@ const def: CommandDefinition = {
     const slice = [...fetched.values()].filter((m) => m.createdTimestamp > twoWeeksAgo).slice(0, amount);
     const res = await ctx.channel.bulkDelete(slice, true);
     await respond(ctx, {
-      embeds: [buildEmbed({ tone: 'success', title: 'Cleared', description: `Removed ${res.size} message${res.size === 1 ? '' : 's'}.` })],
+      embeds: [
+        actionDone({
+          action: 'Channel cleared',
+          target: `<#${ctx.channel.id}>`,
+          detail: `Removed **${res.size}** message${res.size === 1 ? '' : 's'}.`,
+        }),
+      ],
       ephemeral: ctx.source === 'slash',
     });
   },

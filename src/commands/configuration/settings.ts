@@ -26,13 +26,23 @@ const def: CommandDefinition = {
     const an = getAntinukeConfig(ctx.guild.id);
     const ar = getAntiraidConfig(ctx.guild.id);
     const am = getAutomodConfig(ctx.guild.id);
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'configuration', title: 'Zabron Settings', description: `Prefix: \`${settings.prefix}\``, fields: [
-      { name: 'Panic mode', value: settings.panicMode ? 'On' : 'Off', inline: true },
-      { name: 'Antinuke', value: an.enabled ? 'On' : 'Off', inline: true },
-      { name: 'Antiraid', value: ar.enabled ? 'On' : 'Off', inline: true },
-      { name: 'Automod', value: am.enabled ? 'On' : 'Off', inline: true },
-      { name: 'Welcome channel', value: settings.modLogChannel ? `<#${settings.modLogChannel}>` : '—', inline: true },
-    ] })] });
+    const features = [an.enabled, ar.enabled, am.enabled].filter(Boolean).length;
+    const overall: '🟢' | '🟡' | '🔴' = features === 3 ? '🟢' : features > 0 ? '🟡' : '🔴';
+    const overallLabel = features === 3 ? 'Fully protected' : features > 0 ? 'Partial protection' : 'No protections enabled';
+    await respond(ctx, {
+      embeds: [buildEmbed({
+        tone: 'configuration',
+        title: `⚙ Zabron Settings — ${overall} ${overallLabel}`,
+        description: `Prefix: \`${settings.prefix}\``,
+        fields: [
+          { name: 'Panic mode', value: settings.panicMode ? '🟠 ACTIVE' : '🟢 Off', inline: true },
+          { name: 'Antinuke', value: an.enabled ? '🟢 Enabled' : '🔴 Disabled', inline: true },
+          { name: 'Antiraid', value: ar.enabled ? '🟢 Enabled' : '🔴 Disabled', inline: true },
+          { name: 'Automod', value: am.enabled ? '🟢 Enabled' : '🔴 Disabled', inline: true },
+          { name: 'Mod log channel', value: settings.modLogChannel ? `<#${settings.modLogChannel}>` : '—', inline: true },
+        ],
+      })],
+    });
   },
 };
 

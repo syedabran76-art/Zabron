@@ -9,7 +9,7 @@ import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError } from '../../handlers/respond.js';
 import { resolveUser } from '../../utils/permissions.js';
 import { canActOn } from '../../utils/permissions.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { actionDone } from '../../embeds/builders.js';
 import { logEvent, buildActorInfo } from '../../services/logging.js';
 
 const def: CommandDefinition = {
@@ -54,7 +54,11 @@ const def: CommandDefinition = {
       await replyError(ctx, `Failed: ${err.message}`);
     });
     await respond(ctx, {
-      embeds: [buildEmbed({ tone: 'success', title: 'Nickname updated', description: `${user.tag} → ${finalNick ?? '(cleared)'}` })],
+      embeds: [actionDone({
+        action: 'Nickname updated',
+        target: `<@${user.id}>`,
+        detail: `New nickname: **${finalNick ?? '_(cleared)_'}**`,
+      })],
     });
     await logEvent({
       guildId: ctx.guild.id,

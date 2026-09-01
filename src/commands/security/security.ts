@@ -41,20 +41,34 @@ const def: CommandDefinition = {
     const am = getAutomodConfig(ctx.guild.id);
     const whitelist = listWhitelist(ctx.guild.id);
 
+    // Compute a top-level security status by inspecting the protection
+    // layers. Any disabled protection while panic is off = degraded.
+    const layers = [an.enabled, ar.enabled, am.enabled];
+    const allArmed = layers.every(Boolean) && !settings.panicMode;
+    const overall = settings.panicMode
+      ? '🟠'
+      : allArmed ? '🟢' : layers.some(Boolean) ? '🟡' : '🔴';
+    const statusLabel = settings.panicMode
+      ? 'PANIC MODE ACTIVE'
+      : allArmed ? 'All systems armed' : 'Partial coverage';
+
     const embed = buildEmbed({
       tone: 'security',
-      title: 'Security Dashboard',
+      title: `🛡 Security Dashboard — ${overall} ${statusLabel}`,
       description: 'Real-time status of every protection layer.',
       fields: [
         { name: 'Antinuke', value: an.enabled ? '🟢 Enabled' : '🔴 Disabled', inline: true },
         { name: 'Antiraid', value: ar.enabled ? '🟢 Enabled' : '🔴 Disabled', inline: true },
         { name: 'Automod', value: am.enabled ? '🟢 Enabled' : '🔴 Disabled', inline: true },
         { name: 'Panic Mode', value: settings.panicMode ? '🟠 ACTIVE' : '🟢 Off', inline: true },
-        { name: 'Whitelist', value: `${whitelist.length} entries`, inline: true },
-        { name: 'Ban threshold', value: `${an.thresholdBans} / ${an.windowSeconds}s`, inline: true },
-        { name: 'Kick threshold', value: `${an.thresholdKicks} / ${an.windowSeconds}s`, inline: true },
-        { name: 'Channel threshold', value: `${an.thresholdChannels} / ${an.windowSeconds}s`, inline: true },
-        { name: 'Role threshold', value: `${an.thresholdRoles} / ${an.windowSeconds}s`, inline: true },
+        { name: 'Whitelist', value: `\`${whitelist.length}\` entr${whitelist.length === 1 ? 'y' : 'ies'}`, inline: true },
+        { name: 'Window', value: `\`${an.windowSeconds}s\``, inline: true },
+        { name: 'Ban limit', value: `\`${an.thresholdBans}\``, inline: true },
+        { name: 'Kick limit', value: `\`${an.thresholdKicks}\``, inline: true },
+        { name: 'Channel limit', value: `\`${an.thresholdChannels}\``, inline: true },
+        { name: 'Role limit', value: `\`${an.thresholdRoles}\``, inline: true },
+        { name: 'Webhook limit', value: `\`${an.thresholdWebhooks}\``, inline: true },
+        { name: 'Antinuke punish', value: `\`${an.punishAction}\``, inline: true },
       ],
     });
     await respond(ctx, { embeds: [embed] });

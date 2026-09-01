@@ -7,7 +7,7 @@ import { ChatInputCommandInteraction, Message, PermissionFlagsBits, SlashCommand
 import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond } from '../../handlers/respond.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, configChange, actionDone } from '../../embeds/builders.js';
 import {
   addWhitelist,
   getAntinukeConfig,
@@ -65,27 +65,56 @@ const def: CommandDefinition = {
     const config = getAntinukeConfig(ctx.guild.id);
 
     if (args.sub === 'status') {
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'security', title: 'Antinuke status', description: `Enabled: **${config.enabled}**`, fields: [
-        { name: 'Bans', value: `${config.thresholdBans} / ${config.windowSeconds}s`, inline: true },
-        { name: 'Kicks', value: `${config.thresholdKicks} / ${config.windowSeconds}s`, inline: true },
-        { name: 'Channels', value: `${config.thresholdChannels} / ${config.windowSeconds}s`, inline: true },
-        { name: 'Roles', value: `${config.thresholdRoles} / ${config.windowSeconds}s`, inline: true },
-        { name: 'Webhooks', value: `${config.thresholdWebhooks} / ${config.windowSeconds}s`, inline: true },
-        { name: 'Punishment', value: config.punishAction, inline: true },
-      ] })] });
+      const whitelist = listWhitelist(ctx.guild.id);
+      await respond(ctx, {
+        embeds: [buildEmbed({
+          tone: 'security',
+          title: `🛡 Antinuke — ${config.enabled ? '🟢 Enabled' : '🔴 Disabled'}`,
+          description: `Active thresholds within a **${config.windowSeconds}s** rolling window.`,
+          fields: [
+            { name: 'Bans',     value: `\`${config.thresholdBans}\``,     inline: true },
+            { name: 'Kicks',    value: `\`${config.thresholdKicks}\``,    inline: true },
+            { name: 'Channels', value: `\`${config.thresholdChannels}\``, inline: true },
+            { name: 'Roles',    value: `\`${config.thresholdRoles}\``,    inline: true },
+            { name: 'Webhooks', value: `\`${config.thresholdWebhooks}\``, inline: true },
+            { name: 'Punishment', value: `\`${config.punishAction}\``, inline: true },
+            { name: 'Whitelisted users/roles', value: `\`${whitelist.length}\``, inline: true },
+          ],
+        })],
+      });
       return;
     }
     if (args.sub === 'enable') {
+      const previous = config.enabled;
       setAntinukeConfig(ctx.guild.id, { enabled: true });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Antinuke enabled' })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Antinuke',
+        previous: previous ? '🟢 Enabled' : '🔴 Disabled',
+        current: '🟢 Enabled',
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (args.sub === 'disable') {
+      const previous = config.enabled;
       setAntinukeConfig(ctx.guild.id, { enabled: false });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Antinuke disabled' })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Antinuke',
+        previous: previous ? '🟢 Enabled' : '🔴 Disabled',
+        current: '🔴 Disabled',
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (args.sub === 'threshold') {
+      const before = {
+        bans: config.thresholdBans,
+        kicks: config.thresholdKicks,
+        channels: config.thresholdChannels,
+        roles: config.thresholdRoles,
+        webhooks: config.thresholdWebhooks,
+        window: config.windowSeconds,
+      };
       const patch: any = {};
       if (args.bans) patch.thresholdBans = args.bans;
       if (args.kicks) patch.thresholdKicks = args.kicks;
@@ -94,24 +123,51 @@ const def: CommandDefinition = {
       if (args.webhooks) patch.thresholdWebhooks = args.webhooks;
       if (args.window) patch.windowSeconds = args.window;
       setAntinukeConfig(ctx.guild.id, patch);
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Thresholds updated' })] });
+      const after = { ...before, ...patch };
+      const summary = [
+        `Bans: \`${before.bans}\` → \`${after.thresholdBans}\``,
+        `Kicks: \`${before.kicks}\` → \`${after.thresholdKicks}\``,
+        `Channels: \`${before.channels}\` → \`${after.thresholdChannels}\``,
+        `Roles: \`${before.roles}\` → \`${after.thresholdRoles}\``,
+        `Webhooks: \`${before.webhooks}\` → \`${after.thresholdWebhooks}\``,
+        `Window: \`${before.window}s\` → \`${after.windowSeconds}s\``,
+      ].join('\n');
+      await respond(ctx, { embeds: [actionDone({
+        action: 'Antinuke thresholds updated',
+        target: ctx.guild.name,
+        detail: summary,
+      })] });
       return;
     }
     if (args.sub === 'punishment') {
+      const before = config.punishAction;
       setAntinukeConfig(ctx.guild.id, { punishAction: args.action });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Punishment updated', description: `Punishment: ${args.action}` })] });
+      await respond(ctx, { embeds: [configChange({
+        setting: 'Antinuke punishment',
+        previous: `\`${before}\``,
+        current: `\`${args.action}\``,
+        actor: { id: ctx.user.id, tag: ctx.user.tag },
+      })] });
       return;
     }
     if (args.sub === 'whitelist') {
       if (args.mode === 'add') {
         addWhitelist(ctx.guild.id, args.target, 'user');
-        await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Whitelisted', description: `<@${args.target}> cannot trigger antinuke.` })] });
+        await respond(ctx, { embeds: [actionDone({
+          action: 'Whitelisted',
+          target: `<@${args.target}>`,
+          detail: '🛡 This user can no longer trigger antinuke detections.',
+        })] });
       } else {
         removeWhitelist(ctx.guild.id, args.target);
-        await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Removed from whitelist' })] });
+        await respond(ctx, { embeds: [actionDone({
+          action: 'Removed from whitelist',
+          target: `<@${args.target}>`,
+          detail: '🛡 Antinuke will now act on this user again.',
+        })] });
       }
     }
-  },
+    },
 };
 
 registerCommand(def);

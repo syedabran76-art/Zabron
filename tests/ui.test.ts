@@ -439,9 +439,15 @@ test('pingResult: uses success tone for healthy ws', () => {
   assert.strictEqual(embed.data.color, SUCCESS_COLOR);
 });
 
-test('pingResult: uses warning tone for high memory', () => {
-  // wsLatency 150ms = degraded (uses warning), so warning tone wins
+test('pingResult: uses error tone when a subsystem is blocked', () => {
+  // memoryMB 600 = blocked, wsLatency 150 = degraded → blocked wins → ERROR_COLOR
   const embed = pingResult({ wsLatency: 150, uptime: '1h', memoryMB: 600, guildCount: 10 });
+  assert.strictEqual(embed.data.color, ERROR_COLOR);
+});
+
+test('pingResult: uses warning tone when only ws is degraded', () => {
+  // wsLatency 150 = degraded, memoryMB 150 = healthy → warning tone
+  const embed = pingResult({ wsLatency: 150, uptime: '1h', memoryMB: 150, guildCount: 10 });
   assert.strictEqual(embed.data.color, WARNING_COLOR);
 });
 

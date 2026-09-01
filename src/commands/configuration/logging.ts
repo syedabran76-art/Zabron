@@ -20,7 +20,7 @@ import { ChatInputCommandInteraction, Message, PermissionFlagsBits, SlashCommand
 import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond } from '../../handlers/respond.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, configChange, actionDone, listResult, emptyState } from '../../embeds/builders.js';
 import { setLoggingChannel, setLoggingEnabled, getAllLoggingChannels, getLoggingConfig } from '../../db/repositories.js';
 import { LOG_CATEGORIES, LogCategory } from '../../types/index.js';
 import { getDatabase } from '../../db/database.js';
@@ -112,36 +112,46 @@ const def: CommandDefinition = {
 
   async run(ctx: CommandContext) {
     if (!ctx.guild) return;
-    const { sub, category, channel, enabled } = ctx.args as any;
+    const args = ctx.args as any;
+    const sub = args.sub;
+    const category = args.category;
+    const channel = args.channel;
+    const enabledFlag = args.enabled;
 
     if (sub === 'set') {
       if (!category || !LOG_CATEGORIES.includes(category as LogCategory)) {
-        await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: 'Invalid category' })] });
+        await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: '✗ Invalid category' })] });
         return;
       }
       if (!channel) {
-        await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: 'Provide a channel' })] });
+        await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: '⚠ Provide a channel' })] });
         return;
       }
+      const before = getLoggingConfig(ctx.guild.id, category).channelId;
       setLoggingChannel(ctx.guild.id, category, channel.id);
       setLoggingEnabled(ctx.guild.id, category, true);
       await respond(ctx, {
-        embeds: [
-          buildEmbed({
-            tone: 'success',
-            title: 'Logging updated',
-            description: `**${category}** → <#${channel.id}>`,
-          }),
-        ],
+        embeds: [configChange({
+          setting: `Logging: \`${category}\``,
+          previous: before ? `<#${before}>` : '`none`',
+          current: `<#${channel.id}>`,
+          actor: { id: ctx.user.id, tag: ctx.user.tag },
+        })],
       });
       return;
     }
 
     if (sub === 'disable') {
       if (!category) return;
+      const before = getLoggingConfig(ctx.guild.id, category).channelId;
       setLoggingEnabled(ctx.guild.id, category, false);
       await respond(ctx, {
-        embeds: [buildEmbed({ tone: 'success', title: 'Disabled', description: `**${category}** logging is now off.` })],
+        embeds: [configChange({
+          setting: `Logging: \`${category}\``,
+          previous: before ? `<#${before}>` : '`none`',
+          current: '`disabled`',
+          actor: { id: ctx.user.id, tag: ctx.user.tag },
+        })],
       });
       return;
     }
@@ -153,13 +163,13 @@ const def: CommandDefinition = {
 
     if (sub === 'test') {
       if (!category || !LOG_CATEGORIES.includes(category as LogCategory)) {
-        await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: 'Invalid category' })] });
+        await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: '✗ Invalid category' })] });
         return;
       }
       const cfg = getLoggingConfig(ctx.guild.id, category);
       if (!cfg.enabled || !cfg.channelId) {
         await respond(ctx, {
-          embeds: [buildEmbed({ tone: 'warning', title: 'No channel configured', description: `**${category}** is not set up.` })],
+          embeds: [buildEmbed({ tone: 'warning', title: '⚠ No channel configured', description: `**${category}** is not set up. Use \`/logging set\` first.` })],
         });
         return;
       }
@@ -182,15 +192,13 @@ const def: CommandDefinition = {
         client: ctx.guild.client,
       });
       await respond(ctx, {
-        embeds: [
-          buildEmbed({
-            tone: result.ok ? 'success' : 'error',
-            title: result.ok ? 'Test sent' : 'Test failed',
-            description: result.ok
-              ? `Sample log delivered to <#${result.channelId}>.`
-              : `Could not deliver: ${result.reason ?? 'unknown error'}`,
-          }),
-        ],
+        embeds: [actionDone({
+          action: result.ok ? 'Test log sent' : 'Test log failed',
+          target: `<#${result.channelId ?? 'unknown'}>`,
+          detail: result.ok
+            ? `Sample log delivered to **${category}**.`
+            : `Could not deliver: ${result.reason ?? 'unknown error'}`,
+        })],
       });
       return;
     }
@@ -200,28 +208,32 @@ const def: CommandDefinition = {
       db.prepare('DELETE FROM logging_config WHERE guild_id = ?').run(ctx.guild.id);
       db.prepare('DELETE FROM log_ignores WHERE guild_id = ?').run(ctx.guild.id);
       await respond(ctx, {
-        embeds: [buildEmbed({ tone: 'success', title: 'Reset complete', description: 'All logging channels cleared.' })],
+        embeds: [actionDone({
+          action: 'Logging reset',
+          target: ctx.guild.name,
+          detail: 'All category channels + ignore list cleared.',
+        })],
       });
       return;
     }
 
     if (sub === 'categories') {
-      const list = LOG_CATEGORIES.map((c) => `• **${c}**`).join('\n');
+      const items = LOG_CATEGORIES.map((c, i) => `**${i + 1}.** \`${c}\``);
       await respond(ctx, {
-        embeds: [
-          buildEmbed({
-            tone: 'info',
-            title: `Logging categories (${LOG_CATEGORIES.length})`,
-            description: list,
-          }),
-        ],
+        embeds: [listResult({
+          title: '📋 Logging categories',
+          items,
+          summary: `All categories available for \`/logging set\`.`,
+          tone: 'log',
+          perPage: 10,
+        })],
       });
       return;
     }
 
     if (sub === 'webhooks') {
       if (!category || !LOG_CATEGORIES.includes(category as LogCategory)) {
-        await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: 'Invalid category' })] });
+        await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: '✗ Invalid category' })] });
         return;
       }
       ensureWebhookTable();
@@ -229,22 +241,21 @@ const def: CommandDefinition = {
       db.prepare(
         `INSERT INTO log_webhooks (guild_id, category, enabled) VALUES (?, ?, ?)
          ON CONFLICT(guild_id, category) DO UPDATE SET enabled = excluded.enabled`,
-      ).run(ctx.guild.id, category, enabled ? 1 : 0);
+      ).run(ctx.guild.id, category, enabledFlag ? 1 : 0);
       await respond(ctx, {
-        embeds: [
-          buildEmbed({
-            tone: 'success',
-            title: 'Webhook delivery updated',
-            description: `**${category}** webhooks: ${enabled ? 'enabled' : 'disabled'}`,
-          }),
-        ],
+        embeds: [configChange({
+          setting: `Webhook delivery: \`${category}\``,
+          previous: enabledFlag ? '`enabled`' : '`disabled`',
+          current: enabledFlag ? '`enabled`' : '`disabled`',
+          actor: { id: ctx.user.id, tag: ctx.user.tag },
+        })],
       });
       return;
     }
 
     if (sub === 'ignore') {
       if (!channel) {
-        await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: 'Provide a channel' })] });
+        await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: '⚠ Provide a channel' })] });
         return;
       }
       ensureWebhookTable();
@@ -252,14 +263,18 @@ const def: CommandDefinition = {
         .prepare('INSERT OR IGNORE INTO log_ignores (guild_id, channel_id) VALUES (?, ?)')
         .run(ctx.guild.id, channel.id);
       await respond(ctx, {
-        embeds: [buildEmbed({ tone: 'success', title: 'Channel ignored', description: `<#${channel.id}> will be skipped by message logs.` })],
+        embeds: [actionDone({
+          action: 'Channel ignored',
+          target: `<#${channel.id}>`,
+          detail: '🛡 This channel will be skipped by message logs.',
+        })],
       });
       return;
     }
 
     if (sub === 'unignore') {
       if (!channel) {
-        await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: 'Provide a channel' })] });
+        await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: '⚠ Provide a channel' })] });
         return;
       }
       ensureWebhookTable();
@@ -267,7 +282,11 @@ const def: CommandDefinition = {
         .prepare('DELETE FROM log_ignores WHERE guild_id = ? AND channel_id = ?')
         .run(ctx.guild.id, channel.id);
       await respond(ctx, {
-        embeds: [buildEmbed({ tone: 'success', title: 'Channel unignored', description: `<#${channel.id}> is no longer skipped.` })],
+        embeds: [actionDone({
+          action: 'Channel unignored',
+          target: `<#${channel.id}>`,
+          detail: '🟢 Message logs will resume in this channel.',
+        })],
       });
       return;
     }
@@ -277,21 +296,41 @@ const def: CommandDefinition = {
       const rows = getDatabase()
         .prepare('SELECT channel_id as channelId FROM log_ignores WHERE guild_id = ?')
         .all(ctx.guild.id) as any[];
-      const list = rows.length ? rows.map((r) => `• <#${r.channelId}>`).join('\n') : '_No ignored channels._';
+      if (!rows.length) {
+        await respond(ctx, { embeds: [emptyState({
+          title: '🟢 No ignored channels',
+          message: 'Message logs are flowing into every category channel.',
+          tone: 'log',
+        })] });
+        return;
+      }
+      const items = rows.map((r, i) => `**${i + 1}.** <#${r.channelId}>`);
       await respond(ctx, {
-        embeds: [buildEmbed({ tone: 'log', title: `Ignored channels (${rows.length})`, description: list })],
+        embeds: [listResult({
+          title: `🚫 Ignored channels (${rows.length})`,
+          items,
+          summary: 'Message log events are suppressed in these channels.',
+          tone: 'log',
+          perPage: 10,
+        })],
       });
       return;
     }
 
     // default: status
     const map = getAllLoggingChannels(ctx.guild.id);
+    const configuredCount = LOG_CATEGORIES.filter((c) => map[c]).length;
     const fields = LOG_CATEGORIES.map((c) => ({
       name: c,
-      value: map[c] ? `<#${map[c]}>` : '—',
+      value: map[c] ? `🟢 <#${map[c]}>` : '🔴 Disabled',
       inline: true,
     }));
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'log', title: 'Logging configuration', fields })] });
+    await respond(ctx, { embeds: [buildEmbed({
+      tone: 'log',
+      title: `📋 Logging — ${configuredCount}/${LOG_CATEGORIES.length} configured`,
+      description: 'Categories with no channel are disabled.',
+      fields,
+    })] });
   },
 };
 
@@ -313,7 +352,11 @@ async function autoCreateChannels(ctx: CommandContext): Promise<void> {
     setLoggingEnabled(ctx.guild.id, cat, true);
     created.push(`<#${ch.id}>`);
   }
-  await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Logging channels created', description: created.join('\n') })] });
+  await respond(ctx, { embeds: [actionDone({
+    action: 'Logging channels created',
+    target: ctx.guild.name,
+    detail: `Set up ${created.length} channels under **Zabron Logs**.`,
+  })] });
 }
 
 /**

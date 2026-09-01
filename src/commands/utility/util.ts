@@ -21,7 +21,7 @@ import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError, deferReply, editReply } from '../../handlers/respond.js';
 import { listByCategory } from '../../handlers/registry.js';
-import { buildEmbed, help as helpEmbed } from '../../embeds/builders.js';
+import { buildEmbed, help as helpEmbed, pingResult, fmtUptime } from '../../embeds/builders.js';
 import { resolveUser } from '../../utils/permissions.js';
 import { discordTime } from '../../utils/duration.js';
 
@@ -100,37 +100,45 @@ const help: CommandDefinition = {
 
 const ping: CommandDefinition = {
   name: 'ping',
-  description: 'Check Zabron latency.',
+  description: 'Check Zabron latency and system health.',
   category: 'utility',
-  buildSlash() { return new SlashCommandBuilder().setName('ping').setDescription('Ping the bot.'); },
+  buildSlash() { return new SlashCommandBuilder().setName('ping').setDescription('Check Zabron health and latency.'); },
   parseSlash() { return {}; },
   parsePrefix() { return {}; },
   async run(ctx: CommandContext) {
     const client = ctx.guild?.client ?? (ctx.interaction?.client);
-    const wsLatency = client?.ws.ping ?? 0;
+
+    // Discord.js returns -1 when no heartbeat has been received yet and
+    // may also report NaN / very large numbers during reconnects. We
+    // pass the raw value straight to pingResult() — `fmtLatency()` in
+    // builders.ts guarantees the user never sees a negative number;
+    // unavailable metrics are shown as `—` with an Unknown status.
+    const rawWs = client?.ws?.ping;
+    const wsLatency: number =
+      typeof rawWs === 'number' && Number.isFinite(rawWs)
+        ? rawWs
+        : -1;
 
     // Real memory usage
-    const memUsage = process.memoryUsage?.() ?? null;
-    const memoryMB = memUsage
-      ? Math.round(memUsage.heapUsed / 1024 / 1024)
-      : 0;
+    const memUsage = process.memoryUsage?.();
+    const memoryMB = memUsage ? Math.round(memUsage.heapUsed / 1024 / 1024) : 0;
 
     // Real guild count
-    const guildCount = client?.guilds?.cache?.size ?? 0;
+    const guildCount: number = client?.guilds?.cache?.size ?? 0;
 
-    // Real uptime
-    const seconds = Math.floor((Date.now() - startedAt) / 1000);
-    const days = Math.floor(seconds / 86400);
-    const hours = Math.floor((seconds % 86400) / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const uptimeStr = days > 0
-      ? `${days}d ${hours}h ${minutes}m`
-      : hours > 0
-        ? `${hours}h ${minutes}m`
-        : `${minutes}m`;
+    // Real uptime (milliseconds — formatting is centralized in builders.ts)
+    const uptimeMs = Date.now() - startedAt;
 
-    const { pingResult } = await import('../../embeds/builders.js');
-    await respond(ctx, { embeds: [pingResult({ wsLatency, uptime: uptimeStr, memoryMB, guildCount })] });
+    await respond(ctx, {
+      embeds: [
+        pingResult({
+          wsLatency,
+          uptimeMs,
+          memoryMB,
+          guildCount,
+        }),
+      ],
+    });
   },
 };
 
@@ -142,12 +150,18 @@ const uptime: CommandDefinition = {
   parseSlash() { return {}; },
   parsePrefix() { return {}; },
   async run(ctx: CommandContext) {
-    const seconds = Math.floor((Date.now() - startedAt) / 1000);
-    const days = Math.floor(seconds / 86400);
-    const hours = Math.floor((seconds % 86400) / 3600);
-    const minutes = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Uptime', description: `${days}d ${hours}h ${minutes}m ${secs}s` })] });
+    const uptimeMs = Date.now() - startedAt;
+    await respond(ctx, {
+      embeds: [buildEmbed({
+        tone: 'info',
+        title: '⏱ Uptime',
+        description: `Zabron has been running for **${fmtUptime(uptimeMs)}**.`,
+        fields: [
+          { name: 'Started', value: discordTime(startedAt, 'R'), inline: true },
+          { name: 'Status',  value: '🟢 Running', inline: true },
+        ],
+      })],
+    });
   },
 };
 
@@ -161,12 +175,22 @@ const botinfo: CommandDefinition = {
   async run(ctx: CommandContext) {
     const client = ctx.guild?.client ?? (ctx.interaction?.client);
     const guilds = client?.guilds?.cache?.size ?? 0;
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'brand', title: 'Zabron', description: 'All-in-one Discord server operating system.', fields: [
-      { name: 'Guilds', value: String(guilds), inline: true },
-      { name: 'Library', value: 'discord.js', inline: true },
-      { name: 'Version', value: '1.0.0', inline: true },
-      { name: 'Started', value: discordTime(startedAt, 'R'), inline: true },
-    ] })] });
+    const uptimeMs = Date.now() - startedAt;
+    await respond(ctx, {
+      embeds: [buildEmbed({
+        tone: 'brand',
+        title: 'About Zabron',
+        description: 'A complete server operating system for Discord — moderation, security, automation, leveling and more in one cohesive bot.',
+        fields: [
+          { name: '🌐 Servers',   value: `\`${guilds}\``, inline: true },
+          { name: '📚 Library',   value: '`discord.js`', inline: true },
+          { name: '🏷 Version',   value: '`1.0.0`', inline: true },
+          { name: '⏱ Uptime',    value: `\`${fmtUptime(uptimeMs)}\``, inline: true },
+          { name: '🟢 Status',    value: '`Online`', inline: true },
+          { name: '🚀 Started',   value: discordTime(startedAt, 'R'), inline: true },
+        ],
+      })],
+    });
   },
 };
 
@@ -229,7 +253,15 @@ const calculator: CommandDefinition = {
     try {
       // eslint-disable-next-line no-new-func
       const result = Function(`"use strict"; return (${expression})`)();
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Calculator', description: `\`${expression}\` = **${result}**` })] });
+      await respond(ctx, { embeds: [buildEmbed({
+        tone: 'info',
+        title: '🧮 Calculator',
+        description: `\`${expression}\` = **${result}**`,
+        fields: [
+          { name: 'Expression', value: `\`${expression}\``, inline: true },
+          { name: 'Result',     value: `\`${result}\``,     inline: true },
+        ],
+      })] });
     } catch (err) {
       await replyError(ctx, `Could not evaluate: ${(err as Error).message}`);
     }
@@ -253,7 +285,17 @@ const timestamp: CommandDefinition = {
     const { datetime, style } = ctx.args as any;
     const ts = Date.parse(datetime);
     if (Number.isNaN(ts)) { await replyError(ctx, 'Invalid datetime.'); return; }
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Timestamp', description: `\`${datetime}\` → <t:${Math.floor(ts / 1000)}:${style}>\nRaw: \`${Math.floor(ts / 1000)}\`` })] });
+    const seconds = Math.floor(ts / 1000);
+    await respond(ctx, { embeds: [buildEmbed({
+      tone: 'info',
+      title: '🕒 Timestamp',
+      description: `<t:${seconds}:${style}>`,
+      fields: [
+        { name: 'Input',   value: `\`${datetime}\``, inline: true },
+        { name: 'Style',   value: `\`${style}\``,    inline: true },
+        { name: 'Unix',    value: `\`${seconds}\``,  inline: true },
+      ],
+    })] });
   },
 };
 
@@ -293,10 +335,16 @@ const user: CommandDefinition = {
   },
   async run(ctx: CommandContext) {
     const target = (ctx.args as any).user ?? ctx.user;
-    const embed = buildEmbed({ tone: 'info', title: target.tag, thumbnailURL: target.displayAvatarURL(), fields: [
-      { name: 'ID', value: target.id, inline: true },
-      { name: 'Created', value: discordTime(target.createdTimestamp, 'F'), inline: true },
-    ] });
+    const embed = buildEmbed({
+      tone: 'info',
+      title: `👤 ${target.tag}`,
+      thumbnailURL: target.displayAvatarURL(),
+      fields: [
+        { name: 'ID',       value: `\`${target.id}\``, inline: true },
+        { name: 'Mention',  value: `<@${target.id}>`, inline: true },
+        { name: 'Created',  value: discordTime(target.createdTimestamp, 'F'), inline: true },
+      ],
+    });
     await respond(ctx, { embeds: [embed] });
   },
 };
@@ -373,7 +421,15 @@ const snipe: CommandDefinition = {
     if (!ctx.channel) return;
     const sniped = snipeCache.get(ctx.channel.id);
     if (!sniped) { await replyError(ctx, 'No recently deleted message here.'); return; }
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Deleted message', description: sniped.content, fields: [{ name: 'Author', value: `<@${sniped.author}>`, inline: true }, { name: 'When', value: discordTime(sniped.ts, 'R'), inline: true }] })] });
+    await respond(ctx, { embeds: [buildEmbed({
+      tone: 'info',
+      title: '🗑 Deleted message',
+      description: sniped.content || '_(empty)_',
+      fields: [
+        { name: 'Author', value: `<@${sniped.author}>`, inline: true },
+        { name: 'When',   value: discordTime(sniped.ts, 'R'), inline: true },
+      ],
+    })] });
   },
 };
 
@@ -388,11 +444,15 @@ const editsnipe: CommandDefinition = {
     if (!ctx.channel) return;
     const e = editSnipeCache.get(ctx.channel.id);
     if (!e) { await replyError(ctx, 'No recently edited message here.'); return; }
-    await respond(ctx, { embeds: [buildEmbed({ tone: 'info', title: 'Edited message', fields: [
-      { name: 'Before', value: e.before || '(empty)', inline: false },
-      { name: 'After', value: e.after || '(empty)', inline: false },
-      { name: 'Author', value: `<@${e.author}>`, inline: true },
-    ] })] });
+    await respond(ctx, { embeds: [buildEmbed({
+      tone: 'info',
+      title: '✏️ Edited message',
+      fields: [
+        { name: 'Before', value: e.before || '_(empty)_', inline: false },
+        { name: 'After',  value: e.after || '_(empty)_', inline: false },
+        { name: 'Author', value: `<@${e.author}>`, inline: true },
+      ],
+    })] });
   },
 };
 

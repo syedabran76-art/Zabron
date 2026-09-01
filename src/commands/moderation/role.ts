@@ -9,7 +9,7 @@ import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError } from '../../handlers/respond.js';
 import { resolveUser } from '../../utils/permissions.js';
 import { canActOn } from '../../utils/permissions.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { actionDone } from '../../embeds/builders.js';
 
 const def: CommandDefinition = {
   name: 'role',
@@ -71,10 +71,10 @@ const def: CommandDefinition = {
     else await target.roles.remove(role, `by ${ctx.user.tag}`);
 
     await respond(ctx, {
-      embeds: [buildEmbed({
-        tone: 'success',
-        title: final === 'add' ? 'Role added' : 'Role removed',
-        description: `${user.tag} — ${role.name} ${final === 'add' ? 'added' : 'removed'}`,
+      embeds: [actionDone({
+        action: final === 'add' ? 'Role added' : 'Role removed',
+        target: `<@${user.id}>`,
+        detail: `Role: <@&${role.id}>`,
       })],
     });
   },

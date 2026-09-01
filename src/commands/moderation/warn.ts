@@ -10,7 +10,7 @@ import { resolveUser } from '../../utils/permissions.js';
 import { addWarning, warningCount } from '../../db/repositories.js';
 import { runModeration } from '../../services/moderation.js';
 import { replyError, replyInfo, respond } from '../../handlers/respond.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { moderationAction } from '../../embeds/builders.js';
 
 const def: CommandDefinition = {
   name: 'warn',
@@ -44,13 +44,28 @@ const def: CommandDefinition = {
     const { user, reason } = ctx.args as any;
     addWarning(ctx.guild.id, user.id, ctx.user.id, reason ?? null);
     const total = warningCount(ctx.guild.id, user.id);
-    const embed = buildEmbed({
-      tone: 'moderation',
-      title: 'Member warned',
-      description: `${user.tag} now has ${total} warning${total === 1 ? '' : 's'}.`,
-      fields: [{ name: 'Reason', value: reason ?? 'No reason provided', inline: false }],
+    // Generate a stable case-id locally so the moderation-action embed can
+    // show it without depending on the runModeration flow (warn is purely
+    // a record-keeping action, not a Discord API call).
+    const id = `WARN-${Date.now().toString(36).toUpperCase()}`;
+    await respond(ctx, {
+      embeds: [
+        moderationAction({
+          action: 'Member warned',
+          target: { id: user.id, tag: user.tag },
+          moderator: { id: ctx.user.id, tag: ctx.user.tag },
+          reason,
+          caseId: id,
+          extraFields: [
+            { name: 'Total warnings', value: `\`${total}\``, inline: true },
+          ],
+        }),
+      ],
     });
-    await respond(ctx, { embeds: [embed] });
+    // Mirror the event into the moderation case log. We pass `silent: true`
+    // because the moderationAction embed above is the single source of
+    // truth for the user reply — runModeration should only record the
+    // case + send the log channel entry.
     await runModeration(
       ctx,
       {
@@ -61,6 +76,7 @@ const def: CommandDefinition = {
         durationMs: null,
         action: 'warn',
         successTitle: 'Member warned',
+        silent: true,
       },
       async () => {},
     );

@@ -56,9 +56,9 @@ const def: CommandDefinition = {
         user,
         reason,
         durationMs: parsed.ms,
+        durationLabel: parsed.formatted,
         action: 'timeout',
         successTitle: 'Member timed out',
-        extraFields: [{ name: 'Duration', value: parsed.formatted, inline: true }],
       },
       async () => {
         const member = await ctx.guild!.members.fetch(user.id);

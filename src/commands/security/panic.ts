@@ -14,7 +14,7 @@ import {
   loadPanicSnapshot,
   clearPanicSnapshot,
 } from '../../db/repositories.js';
-import { buildEmbed } from '../../embeds/builders.js';
+import { buildEmbed, securityAlert } from '../../embeds/builders.js';
 import {
   setAntinukeConfig,
   setAntiraidConfig,
@@ -24,6 +24,7 @@ import {
   getAutomodConfig,
 } from '../../services/security.js';
 import { logEvent, buildActorInfo } from '../../services/logging.js';
+import { eventId } from '../../utils/ids.js';
 
 const def: CommandDefinition = {
   name: 'panic',
@@ -55,7 +56,23 @@ const def: CommandDefinition = {
     const settings = getGuildSettings(ctx.guild.id);
     const { sub } = ctx.args as any;
     if (sub === 'status') {
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'security', title: 'Panic mode', description: settings.panicMode ? '🟠 ACTIVE — all protections enforced aggressively.' : '🟢 Off' })] });
+      const an = getAntinukeConfig(ctx.guild.id);
+      const ar = getAntiraidConfig(ctx.guild.id);
+      const am = getAutomodConfig(ctx.guild.id);
+      await respond(ctx, {
+        embeds: [buildEmbed({
+          tone: 'security',
+          title: `🚨 Panic mode — ${settings.panicMode ? '🟠 ACTIVE' : '🟢 Off'}`,
+          description: settings.panicMode
+            ? 'All protections are enforced at maximum aggressiveness until disabled.'
+            : 'Protections are running at their configured levels.',
+          fields: [
+            { name: 'Antinuke', value: `${an.enabled ? '🟢' : '🔴'} ${an.enabled ? 'Enabled' : 'Disabled'}`, inline: true },
+            { name: 'Antiraid', value: `${ar.enabled ? '🟢' : '🔴'} ${ar.enabled ? 'Enabled' : 'Disabled'}`, inline: true },
+            { name: 'Automod',  value: `${am.enabled ? '🟢' : '🔴'} ${am.enabled ? 'Enabled' : 'Disabled'}`, inline: true },
+          ],
+        })],
+      });
       return;
     }
     if (sub === 'enable') {
@@ -68,7 +85,16 @@ const def: CommandDefinition = {
       setAntinukeConfig(ctx.guild.id, { enabled: true });
       setAntiraidConfig(ctx.guild.id, { enabled: true });
       setAutomodConfig(ctx.guild.id, { enabled: true });
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: 'Panic mode enabled', description: 'All protections increased. Only administrators can issue commands until disabled.' })] });
+      await respond(ctx, {
+        embeds: [securityAlert({
+          title: '🚨 Panic mode enabled',
+          description: 'All protections are now enforced at maximum aggressiveness. Only administrators may issue commands until disabled.',
+          eventId: eventId('SEC'),
+          risk: 'CRITICAL',
+          actor: { id: ctx.user.id, tag: ctx.user.tag },
+          action: 'lockdown',
+        })],
+      });
       await logEvent({ guildId: ctx.guild.id, category: 'security', title: 'Panic mode enabled', author: buildActorInfo(ctx.member), client: ctx.guild.client });
       return;
     }
@@ -82,7 +108,16 @@ const def: CommandDefinition = {
         setAutomodConfig(ctx.guild.id, { enabled: snap.automodEnabled });
         clearPanicSnapshot(ctx.guild.id);
       }
-      await respond(ctx, { embeds: [buildEmbed({ tone: 'success', title: 'Panic mode disabled' })] });
+      await respond(ctx, {
+        embeds: [securityAlert({
+          title: '✅ Panic mode disabled',
+          description: 'Protection state has been restored to the pre-panic snapshot.',
+          eventId: eventId('SEC'),
+          risk: 'LOW',
+          actor: { id: ctx.user.id, tag: ctx.user.tag },
+          action: 'restore',
+        })],
+      });
       await logEvent({ guildId: ctx.guild.id, category: 'security', title: 'Panic mode disabled', author: buildActorInfo(ctx.member), client: ctx.guild.client });
     }
   },

@@ -7,8 +7,8 @@ import { ChatInputCommandInteraction, Message, OverwriteType, PermissionFlagsBit
 import type { CommandContext, CommandDefinition } from '../../types/index.js';
 import { registerCommand } from '../../handlers/registry.js';
 import { respond, replyError } from '../../handlers/respond.js';
-import { buildEmbed } from '../../embeds/builders.js';
-import { parseDuration } from '../../utils/duration.js';
+import { actionDone, buildEmbed, moderationAction } from '../../embeds/builders.js';
+import { parseDuration, formatDuration } from '../../utils/duration.js';
 import { logEvent, buildActorInfo } from '../../services/logging.js';
 import {
   insertModerationCase,
@@ -35,7 +35,13 @@ async function runLock(ctx: CommandContext, args: LockArgs): Promise<void> {
     await target.permissionOverwrites.edit(everyone, { SendMessages: null }).catch(() => {});
     clearChannelLock(ctx.guild.id, target.id);
     await respond(ctx, {
-      embeds: [buildEmbed({ tone: 'success', title: 'Channel unlocked', description: `<#${target.id}> is open for everyone again.` })],
+      embeds: [
+        actionDone({
+          action: 'Channel unlocked',
+          target: `<#${target.id}>`,
+          detail: '🟢 Open for everyone again.',
+        }),
+      ],
     });
     await logEvent({
       guildId: ctx.guild.id,
@@ -78,17 +84,29 @@ async function runLock(ctx: CommandContext, args: LockArgs): Promise<void> {
     timer.unref?.();
   }
 
+  const caseIdStr = `LOCK-${Date.now().toString(36).toUpperCase()}`;
+  const lockDurationMs = args.duration ? parseDuration(args.duration)?.ms ?? null : null;
   await respond(ctx, {
-    embeds: [buildEmbed({ tone: 'warning', title: 'Channel locked', description: `<#${target.id}> is now read-only.${args.duration ? `\nDuration: ${args.duration}` : ''}` })],
+    embeds: [
+      moderationAction({
+        action: 'Channel locked',
+        target: { id: target.id, tag: target.name ?? target.id },
+        moderator: { id: ctx.user.id, tag: ctx.user.tag },
+        reason: args.reason,
+        duration: lockDurationMs ? formatDuration(lockDurationMs) : null,
+        caseId: caseIdStr,
+        description: `<#${target.id}> is now read-only${args.duration ? ` — auto-unlock in **${args.duration}**` : ' indefinitely'}.`,
+      }),
+    ],
   });
   insertModerationCase({
-    id: `LOCK-${Date.now().toString(36).toUpperCase()}`,
+    id: caseIdStr,
     guildId: ctx.guild.id,
     targetId: target.id,
     moderatorId: ctx.user.id,
     action: 'lock',
     reason: args.reason,
-    duration: args.duration ? parseDuration(args.duration)?.ms ?? null : null,
+    duration: lockDurationMs,
     metadata: null,
   });
   await logEvent({

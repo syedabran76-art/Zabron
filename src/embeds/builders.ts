@@ -1025,6 +1025,68 @@ export function mentionHelpEmbed(opts: {
 }
 
 /**
+ * Build the polished DM sent to the user who just invited Zabron to
+ * a new guild.
+ *
+ * Layout contract:
+ *   - Title:    "👋 Thanks for adding Zabron!"
+ *   - Desc:     "Zabron is now ready to help manage your server."
+ *               + the brand tagline ("Protect • Automate • Manage")
+ *   - Fields:   Getting Started / Commands / Support
+ *   - Tone:     'welcome' (uses WELCOME_COLOR)
+ *
+ * The brand is rendered through `BRAND_NAME` and `BOT_TAGLINE` so a
+ * future brand rename only needs to touch this file.
+ *
+ * `supportUrl` is optional: when omitted or empty, the Support field
+ * renders "Not configured" and the caller skips the Support button.
+ */
+export function inviterDmEmbed(opts: {
+  /**
+   * Pre-validated support server URL. When omitted/empty the Support
+   * field renders "Not configured" so the rest of the embed stays
+   * usable.
+   */
+  supportUrl?: string | null;
+}): EmbedBuilder {
+  const supportConfigured = !!opts.supportUrl && opts.supportUrl.trim().length > 0;
+
+  const description =
+    `**Zabron is now ready to help manage your server.**\n\n` +
+    `${BOT_TAGLINE}`;
+
+  const fields: EmbedField[] = [
+    {
+      name: '🚀 Getting Started',
+      value:
+        `Run \`/setup\` to configure welcome messages, logging channels, ` +
+        `automod, antinuke and more — all in one guided flow.`,
+      inline: false,
+    },
+    {
+      name: '📖 Commands',
+      value: `Run \`/help\` to browse every command available in your server.`,
+      inline: false,
+    },
+    {
+      name: '💬 Support',
+      value: supportConfigured
+        ? 'Join the official Zabron Support Server for help, updates, and feedback.'
+        : 'Support server is not configured by the bot owner yet.',
+      inline: true,
+    },
+  ];
+
+  return buildEmbed({
+    title: `👋 Thanks for adding ${BRAND_NAME}!`,
+    description,
+    fields,
+    tone: 'welcome',
+    timestamp: Date.now(),
+  });
+}
+
+/**
  * Build the optional button row containing the Support button.
  *
  * Returns `null` when no URL is configured so callers can skip adding

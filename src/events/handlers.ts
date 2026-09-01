@@ -97,6 +97,7 @@ import { runWorkflowsForTrigger } from '../services/automation.js';
 import { truncate } from '../embeds/builders.js';
 import {
   sendGuildWelcomeMessage,
+  sendInviterDm,
   buildMentionReplyPayload,
 } from '../services/onboarding.js';
 
@@ -123,7 +124,7 @@ export function attachEventHandlers(client: any): void {
   client.on(Events.GuildMemberUpdate, (o: GuildMember, n: GuildMember) => safeRun(() => onMemberUpdate(o, n, client), 'onMemberUpdate'));
   client.on(Events.GuildBanAdd, (ban: any) => safeRun(() => onGuildBanAdd(ban, client), 'onGuildBanAdd'));
   client.on(Events.GuildBanRemove, (ban: any) => safeRun(() => onGuildBanRemove(ban, client), 'onGuildBanRemove'));
-  client.on(Events.GuildCreate, (g: any) => safeRun(() => onGuildCreate(g), 'onGuildCreate'));
+  client.on(Events.GuildCreate, (g: any) => safeRun(() => onGuildCreate(g, client), 'onGuildCreate'));
   client.on(Events.GuildUpdate, (o: any, n: any) => safeRun(() => onGuildUpdate(o, n, client), 'onGuildUpdate'));
   client.on(Events.GuildAuditLogEntryCreate, (entry: GuildAuditLogsEntry, guild: Guild) =>
     safeRun(() => onAuditLogEntry(entry, guild, client), 'onAuditLogEntry'),
@@ -752,11 +753,13 @@ async function onGuildBanRemove(ban: any, client: any): Promise<void> {
 // Guild lifecycle
 // ============================================================================
 
-async function onGuildCreate(g: any): Promise<void> {
+async function onGuildCreate(g: any, client: any): Promise<void> {
   // Always seed guild settings first so the welcome embed has a row to
   // read its prefix from (even on a brand-new guild).
   getDatabase().prepare('INSERT OR IGNORE INTO guild_settings (guild_id, prefix, panic_mode, created_at, updated_at) VALUES (?, ?, 0, ?, ?)').run(g.id, '.', Date.now(), Date.now());
 
+  // 1. Public welcome message.
+  //
   // Send the polished welcome message. The onboarding service is
   // responsible for channel selection, idempotency (across reconnects),
   // graceful failure, and never DMing random members. Any error here
@@ -769,6 +772,31 @@ async function onGuildCreate(g: any): Promise<void> {
     // try/caught, but a thrown error here would otherwise bubble up
     // into safeRun() and surface to stderr. Keep the message clear.
     console.warn('[zabron] sendGuildWelcomeMessage threw unexpectedly:', (err as Error).message);
+  }
+
+  // 2. Inviter DM.
+  //
+  // Best-effort DM to the user who actually added Zabron to the guild.
+  // The onboarding service:
+  //   - resolves the inviter from the BotAdd audit log entry,
+  //   - matches the audit entry's target to the bot's own user ID so
+  //     we never attribute the wrong bot-add,
+  //   - safely catches every Discord API failure (closed DMs, blocked
+  //     bot, missing VIEW_AUDIT_LOG, missing audit entry, etc.) and
+  //     returns a structured status instead of throwing.
+  //
+  // We deliberately do NOT await the public welcome before this — the
+  // two flows are independent and either can fail without affecting
+  // the other. The DM is also idempotent against reconnects via the
+  // shared `welcomedGuilds` Set so a brief network blip never produces
+  // a duplicate DM.
+  try {
+    await sendInviterDm(g, client);
+  } catch (err) {
+    // sendInviterDm is already try/caught internally, but we add an
+    // outer guard so an unexpected throw still cannot crash the
+    // gateway event loop.
+    console.warn('[zabron] sendInviterDm threw unexpectedly:', (err as Error).message);
   }
 }
 

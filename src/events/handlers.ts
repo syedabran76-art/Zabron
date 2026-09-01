@@ -1,54 +1,148 @@
 /**
  * Zabron — Event handler orchestration.
  *
- * Wires up messageCreate (snipe, AFK, automod, leveling, autoresponder,
- * custom commands), guildMemberAdd (welcome, autorole, antiraid),
- * guildMemberRemove (goodbye, invite), and audit-log-based antinuke
- * detection.
+ * Every Discord gateway event that the bot reacts to is wired up here.
+ * Logging is centralised through `services/logging.ts` so branding and
+ * error isolation stay consistent across the whole codebase.
+ *
+ * Coverage:
+ *   - messageCreate / messageUpdate / messageDelete / messageBulkDelete
+ *   - guildMemberAdd / guildMemberRemove / guildMemberUpdate (nickname,
+ *     roles, timeout, server boost)
+ *   - guildBanAdd / guildBanRemove
+ *   - guildCreate / guildUpdate
+ *   - voiceStateUpdate
+ *   - channelCreate / channelDelete / channelUpdate
+ *   - roleCreate / roleDelete / roleUpdate (via GuildRoleUpdate)
+ *   - webhooksUpdate (resolved via audit log)
+ *   - interactionCreate
+ *
+ * Each handler is fault-tolerant: Discord API failures, missing
+ * permissions, missing channels, and partial objects are caught so a
+ * logging failure can never crash the underlying event handler.
  */
 
 import {
   Events,
   Message,
   GuildMember,
+  PartialGuildMember,
   AuditLogEvent,
   PermissionFlagsBits,
   ChannelType,
   Collection,
+  GuildAuditLogsEntry,
+  Role,
+  GuildChannel,
+  Guild,
+  EmbedField,
 } from 'discord.js';
 
 import { editSnipeCacheRef, snipeCacheRef } from '../commands/utility/util.js';
-import { getAfk, clearAfk, getCustomCommand, incrementCustomCommandUsage, listAutoresponders, addXp, getLevelingUser, ensureInviteCache, getInviteCache, recordInviteUse, adjustInviteCount, setTempvoiceGenerator, getTempvoiceConfig, registerTempvoice, deleteTempvoice, getTempvoice } from '../db/repositories.js';
+import {
+  getAfk,
+  clearAfk,
+  getCustomCommand,
+  incrementCustomCommandUsage,
+  listAutoresponders,
+  addXp,
+  getLevelingUser,
+  ensureInviteCache,
+  getInviteCache,
+  recordInviteUse,
+  adjustInviteCount,
+  setTempvoiceGenerator,
+  getTempvoiceConfig,
+  registerTempvoice,
+  deleteTempvoice,
+  getTempvoice,
+} from '../db/repositories.js';
 import { getDatabase } from '../db/database.js';
-import { getAutomodConfig, getAntiraidConfig, getAntinukeConfig, isAutomodExempt, trackAntinukeEvent, isWhitelisted, isWhitelistedWithRoles } from '../services/security.js';
+import {
+  getAutomodConfig,
+  getAntiraidConfig,
+  getAntinukeConfig,
+  isAutomodExempt,
+  trackAntinukeEvent,
+  isWhitelisted,
+  isWhitelistedWithRoles,
+} from '../services/security.js';
 import { evaluateMessage } from '../services/automodScanner.js';
 import { xpForLevel, levelFromXp } from '../commands/leveling/leveling.js';
 import { resolveVariables } from '../utils/variables.js';
-import { logEvent, buildActorInfo } from '../services/logging.js';
+import {
+  logEvent,
+  buildActorInfo,
+  resolveAuditExecutor,
+  logMessageDelete,
+  logMessageBulkDelete,
+  logMessageEdit,
+  logMemberJoin,
+  logMemberLeave,
+  logMemberNicknameChange,
+  logMemberRoleChange,
+  logMemberTimeoutChange,
+  logMemberBoostChange,
+  logBanAdd,
+  logBanRemove,
+  logChannelEvent,
+  logRoleEvent,
+  logWebhookEvent,
+  ActorInfo,
+} from '../services/logging.js';
 import { addWarning } from '../db/repositories.js';
 import { setAfk } from '../db/repositories.js';
 import { handleGiveawayJoin, handleGiveawayLeave } from '../commands/giveaways/giveaway.js';
 import { runWorkflowsForTrigger } from '../services/automation.js';
+import { truncate } from '../embeds/builders.js';
 
 const recentMessagesByGuild = new Map<string, { content: string; ts: number; author: string }[]>();
 
 export function attachEventHandlers(client: any): void {
-  client.on(Events.MessageCreate, (message: Message) => onMessage(message, client));
-  client.on(Events.MessageUpdate, (_o: Message, n: Message) => onMessageUpdate(_o, n, client));
-  client.on(Events.MessageDelete, (m: Message) => onMessageDelete(m));
-  client.on(Events.GuildMemberAdd, (m: GuildMember) => onMemberAdd(m, client));
-  client.on(Events.GuildMemberRemove, (m: GuildMember | { guild: any; user: any }) => onMemberRemove(m, client));
-  client.on(Events.GuildMemberUpdate, (o: GuildMember, n: GuildMember) => onMemberUpdate(o, n, client));
-  client.on(Events.GuildCreate, (g: any) => onGuildCreate(g, client));
-  client.on(Events.VoiceStateUpdate, (o: any, n: any) => onVoiceStateUpdate(o, n, client));
-  client.on(Events.ChannelCreate, (c: any) => onChannelChange(c, 'channel_create', client));
-  client.on(Events.ChannelDelete, (c: any) => onChannelChange(c, 'channel_delete', client));
-  // discord.js v14 renamed RoleCreate/RoleDelete to GuildRoleCreate/GuildRoleDelete.
-  client.on(Events.GuildRoleCreate, (r: any) => onRoleChange(r, 'role_create', client));
-  client.on(Events.GuildRoleDelete, (r: any) => onRoleChange(r, 'role_delete', client));
-  client.on(Events.WebhooksUpdate as any, (c: any) => onWebhookUpdate(c, client));
-  client.on(Events.InteractionCreate, (i: any) => onInteraction(i, client));
+  client.on(Events.MessageCreate, (message: Message) => safeRun(() => onMessage(message, client), 'onMessage'));
+  client.on(Events.MessageUpdate, (_o: Message, n: Message) => safeRun(() => onMessageUpdate(_o, n, client), 'onMessageUpdate'));
+  client.on(Events.MessageDelete, (m: Message) => safeRun(() => onMessageDelete(m), 'onMessageDelete'));
+  client.on(Events.MessageBulkDelete, (msgs: Collection<string, Message>, ch: any) => safeRun(() => onMessageBulkDelete(msgs, ch, client), 'onMessageBulkDelete'));
+  client.on(Events.GuildMemberAdd, (m: GuildMember) => safeRun(() => onMemberAdd(m, client), 'onMemberAdd'));
+  client.on(Events.GuildMemberRemove, (m: GuildMember | PartialGuildMember) => safeRun(() => onMemberRemove(m, client), 'onMemberRemove'));
+  client.on(Events.GuildMemberUpdate, (o: GuildMember, n: GuildMember) => safeRun(() => onMemberUpdate(o, n, client), 'onMemberUpdate'));
+  client.on(Events.GuildBanAdd, (ban: any) => safeRun(() => onGuildBanAdd(ban, client), 'onGuildBanAdd'));
+  client.on(Events.GuildBanRemove, (ban: any) => safeRun(() => onGuildBanRemove(ban, client), 'onGuildBanRemove'));
+  client.on(Events.GuildCreate, (g: any) => safeRun(() => onGuildCreate(g), 'onGuildCreate'));
+  client.on(Events.GuildUpdate, (o: any, n: any) => safeRun(() => onGuildUpdate(o, n, client), 'onGuildUpdate'));
+  client.on(Events.GuildAuditLogEntryCreate, (entry: GuildAuditLogsEntry, guild: Guild) =>
+    safeRun(() => onAuditLogEntry(entry, guild, client), 'onAuditLogEntry'),
+  );
+  client.on(Events.VoiceStateUpdate, (_o: any, n: any) => safeRun(() => onVoiceStateUpdate(_o, n, client), 'onVoiceStateUpdate'));
+  client.on(Events.ChannelCreate, (c: any) => safeRun(() => onChannelChange(c, 'create', null, client), 'onChannelCreate'));
+  client.on(Events.ChannelDelete, (c: any) => safeRun(() => onChannelChange(c, 'delete', null, client), 'onChannelDelete'));
+  client.on(Events.ChannelUpdate, (o: any, n: any) => safeRun(() => onChannelUpdate(o, n, client), 'onChannelUpdate'));
+  client.on(Events.GuildRoleCreate, (r: Role) => safeRun(() => onRoleChange(r, 'create', null, client), 'onGuildRoleCreate'));
+  client.on(Events.GuildRoleDelete, (r: Role) => safeRun(() => onRoleChange(r, 'delete', null, client), 'onGuildRoleDelete'));
+  client.on(Events.GuildRoleUpdate, (o: Role, n: Role) => safeRun(() => onRoleUpdate(o, n, client), 'onGuildRoleUpdate'));
+  client.on(Events.WebhooksUpdate as any, (c: any) => safeRun(() => onWebhookUpdate(c, client), 'onWebhooksUpdate'));
+  client.on(Events.InteractionCreate, (i: any) => safeRun(() => onInteraction(i, client), 'onInteraction'));
 }
+
+/**
+ * Run a handler but swallow ANY error so a logging failure can never
+ * crash the underlying Discord event loop. We surface a short warning
+ * to stderr so devs can still see what blew up.
+ */
+async function safeRun(fn: () => Promise<void>, name: string): Promise<void> {
+  try {
+    await fn();
+  } catch (err) {
+    try {
+      // eslint-disable-next-line no-console
+      console.warn(`[zabron] handler ${name} failed:`, (err as Error).message);
+    } catch {}
+  }
+}
+
+// ============================================================================
+// Message events
+// ============================================================================
 
 async function onMessage(message: Message, client: any): Promise<void> {
   if (!message.guild) return;
@@ -189,8 +283,10 @@ async function onMessage(message: Message, client: any): Promise<void> {
   }
 
   // Sticky
-  const { handleSticky } = await import('../services/sticky.js');
-  await handleSticky(message as any);
+  try {
+    const { handleSticky } = await import('../services/sticky.js');
+    await handleSticky(message as any);
+  } catch {}
 
   // Automation engine
   await runWorkflowsForTrigger(guildId, 'message_create', { guild: message.guild, user: message.author, channel: message.channel as any, message: { id: message.id, content: message.content ?? '', author: { id: message.author.id, tag: message.author.tag } } });
@@ -203,42 +299,88 @@ async function onMessageUpdate(_o: Message, n: Message, client: any): Promise<vo
   // Only log edits where the content actually changed.
   if (_o?.content === n.content) return;
 
-  const before = (_o?.content ?? '').slice(0, 500);
-  const after = (n.content ?? '').slice(0, 500);
-  await logEvent({
-    guildId: n.guild.id,
-    category: 'message',
-    title: 'Message edited',
-    description: `Edited in <#${n.channel.id}>`,
-    fields: [
-      { name: 'Before', value: before ? `\`\`\`\n${before}\n\`\`\`` : '_empty_', inline: false },
-      { name: 'After', value: after ? `\`\`\`\n${after}\n\`\`\`` : '_empty_', inline: false },
-      { name: 'Jump', value: `[Go to message](${n.url})`, inline: false },
-    ],
-    author: n.author ? { id: n.author.id, tag: n.author.tag, avatar: n.author.displayAvatarURL() } : undefined,
-    channelId: n.channel.id,
-    client,
+  let author: ActorInfo | null = null;
+  if (n.author) {
+    author = {
+      id: n.author.id,
+      tag: n.author.tag ?? n.author.username ?? n.author.id,
+      avatar: n.author.displayAvatarURL?.(),
+    };
+  }
+
+  await logMessageEdit(client, n.guild.id, {
+    before: _o?.content ?? '',
+    after: n.content ?? '',
+    message: n,
+    author,
   });
 }
 
 async function onMessageDelete(m: Message): Promise<void> {
   if (!m.guild) return;
-  const preview = (m.content ?? '').slice(0, 512);
-  await logEvent({
-    guildId: m.guild.id,
-    category: 'message',
-    title: 'Message deleted',
-    description: preview || '_no content_',
-    fields: [
-      { name: 'Channel', value: `<#${m.channel.id}>`, inline: true },
-      { name: 'Author ID', value: m.author ? `\`${m.author.id}\`` : '`unknown`', inline: true },
-      { name: 'Message ID', value: `\`${m.id}\``, inline: true },
-    ],
-    author: m.author ? { id: m.author.id, tag: m.author.tag, avatar: m.author.displayAvatarURL() } : null,
-    channelId: m.channel.id,
-    client: m.guild.client,
+  // Resolve audit log executor. The newest matching audit entry for
+  // either MessageBulkDelete or MessageDelete targeting this message
+  // (or its channel) within the last 30s is our actor.
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: m.guild,
+      // For bulk deletes the entry's target is the channel, not the
+      // message, so we still pass targetId so single-message deletes
+      // match first.
+      action: [AuditLogEvent.MessageDelete, AuditLogEvent.MessageBulkDelete],
+      targetId: m.id,
+      channelId: m.channel?.id,
+      maxAgeMs: 30_000,
+      limit: 15,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
+
+  // Pass the partial message straight to logMessageDelete — it now
+  // handles fetch() failures internally and renders a "content
+  // unavailable" placeholder when the message can't be hydrated.
+  await logMessageDelete(m.guild.client, m.guild.id, {
+    message: m,
+    executor,
+    reason,
   });
 }
+
+async function onMessageBulkDelete(messages: Collection<string, Message>, channel: any, client: any): Promise<void> {
+  if (!channel?.guild) return;
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: channel.guild,
+      // For MessageBulkDelete the audit entry's target is the channel,
+      // not any of the deleted messages — pass channelId so we match.
+      action: AuditLogEvent.MessageBulkDelete,
+      targetId: channel.id,
+      channelId: channel.id,
+      maxAgeMs: 30_000,
+      limit: 15,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
+
+  const msgArray = Array.from(messages.values());
+  await logMessageBulkDelete(client, channel.guild.id, {
+    channelId: channel.id,
+    channelName: channel.name,
+    count: msgArray.length,
+    messages: msgArray,
+    executor,
+  });
+}
+
+// ============================================================================
+// Member events
+// ============================================================================
 
 async function onMemberAdd(member: GuildMember, client: any): Promise<void> {
   if (member.user.bot) {
@@ -301,7 +443,7 @@ async function onMemberAdd(member: GuildMember, client: any): Promise<void> {
   // Welcome
   if (settings?.welcome_channel) {
     const channel = await member.guild.channels.fetch(settings.welcome_channel).catch(() => null);
-    if (channel && channel.type !== 15 /* not a Forum */ && 'send' in channel) {
+    if (channel && channel.type !== ChannelType.GuildForum && 'send' in channel) {
       const message = resolveVariables(settings.welcome_message ?? 'Welcome {mention} to {server}!', { user: member, guild: member.guild });
       try { await (channel as any).send({ content: message, allowedMentions: { parse: ['users'] } }); } catch {}
     }
@@ -336,35 +478,289 @@ async function onMemberAdd(member: GuildMember, client: any): Promise<void> {
     }
   } catch {}
 
-  await logEvent({ guildId: member.guild.id, category: 'member', title: 'Member joined', description: `${member.user.tag} (${member.id})`, author: { id: member.user.id, tag: member.user.tag, avatar: member.user.displayAvatarURL() }, client });
+  await logMemberJoin(client, member.guild.id, {
+    id: member.user.id,
+    tag: member.user.tag,
+    avatar: member.user.displayAvatarURL(),
+    createdTimestamp: member.user.createdTimestamp,
+  });
   await runWorkflowsForTrigger(member.guild.id, 'member_join', { guild: member.guild, user: member, channel: member.guild.channels.cache.first() as any, raw: { account_age: Date.now() - member.user.createdTimestamp } });
 }
 
-async function onMemberRemove(member: GuildMember | { guild: any; user: any }, client: any): Promise<void> {
+async function onMemberRemove(member: GuildMember | PartialGuildMember, client: any): Promise<void> {
   const guild = (member as any).guild;
   const user = (member as any).user;
   if (!guild || !user) return;
   const settings = getDatabase().prepare('SELECT goodbye_channel, goodbye_message FROM guild_settings WHERE guild_id = ?').get(guild.id) as any;
   if (settings?.goodbye_channel) {
     const channel = await guild.channels.fetch(settings.goodbye_channel).catch(() => null);
-    if (channel && channel.type !== 15 /* not a Forum */ && 'send' in channel) {
+    if (channel && channel.type !== ChannelType.GuildForum && 'send' in channel) {
       const message = resolveVariables(settings.goodbye_message ?? '{username} has left the server.', { user: member as any, guild });
       try { await (channel as any).send({ content: message, allowedMentions: { parse: [] } }); } catch {}
     }
   }
-  await logEvent({ guildId: guild.id, category: 'member', title: 'Member left', description: `${user.tag} (${user.id})`, client });
+  await logMemberLeave(client, guild.id, {
+    id: user.id,
+    tag: user.tag ?? user.username ?? user.id,
+    avatar: user.displayAvatarURL?.(),
+  });
   await runWorkflowsForTrigger(guild.id, 'member_leave', { guild, user, channel: guild.channels.cache.first() as any });
 }
 
 async function onMemberUpdate(o: GuildMember, n: GuildMember, client: any): Promise<void> {
+  // Nickname change.
   if (o.nickname !== n.nickname) {
-    await logEvent({ guildId: n.guild.id, category: 'member', title: 'Nickname changed', fields: [{ name: 'Old', value: o.nickname ?? '(none)', inline: false }, { name: 'New', value: n.nickname ?? '(none)', inline: false }], author: { id: n.user.id, tag: n.user.tag, avatar: n.user.displayAvatarURL() }, client });
+    await logMemberNicknameChange(client, n.guild.id, {
+      id: n.user.id,
+      tag: n.user.tag ?? n.user.username ?? n.user.id,
+      avatar: n.user.displayAvatarURL?.(),
+    }, o.nickname ?? null, n.nickname ?? null);
+  }
+
+  // Role add/remove detection — compare cached role sets.
+  const before = new Set(o.roles.cache.map((r) => r.id));
+  const after = new Set(n.roles.cache.map((r) => r.id));
+  const added: Role[] = [];
+  const removed: Role[] = [];
+  for (const id of after) if (!before.has(id)) added.push(n.roles.cache.get(id) as Role);
+  for (const id of before) if (!after.has(id)) removed.push(o.roles.cache.get(id) as Role);
+  if (added.length || removed.length) {
+    // Attribute to audit log where possible so we surface the moderator.
+    let executor: ActorInfo | null = null;
+    try {
+      const audit = await resolveAuditExecutor({
+        guild: n.guild,
+        action: AuditLogEvent.MemberRoleUpdate,
+        targetId: n.user.id,
+        maxAgeMs: 30_000,
+        limit: 5,
+      });
+      executor = audit.executor;
+    } catch {}
+    if (added.length || removed.length) {
+      await logMemberRoleChange(client, n.guild.id, {
+        id: n.user.id,
+        tag: n.user.tag ?? n.user.username ?? n.user.id,
+        avatar: n.user.displayAvatarURL?.(),
+      }, added, removed);
+    }
+    // If we got an executor, log it under moderator category so admins
+    // can audit role changes performed by staff.
+    if (executor) {
+      await logEvent({
+        client,
+        guildId: n.guild.id,
+        category: 'moderation',
+        title: 'Roles changed by moderator',
+        description: `${executor.tag} changed <@${n.user.id}>'s roles.`,
+        actor: executor,
+        target: { id: n.user.id, tag: n.user.tag ?? n.user.id, avatar: n.user.displayAvatarURL?.() },
+        risk: 'MEDIUM',
+      });
+    }
+  }
+
+  // Timeout change detection.
+  const beforeTo = o.communicationDisabledUntilTimestamp ?? null;
+  const afterTo = n.communicationDisabledUntilTimestamp ?? null;
+  const beforeDate = beforeTo ? new Date(beforeTo) : null;
+  const afterDate = afterTo ? new Date(afterTo) : null;
+  if ((beforeDate?.getTime() ?? 0) !== (afterDate?.getTime() ?? 0)) {
+    await logMemberTimeoutChange(client, n.guild.id, {
+      id: n.user.id,
+      tag: n.user.tag ?? n.user.username ?? n.user.id,
+      avatar: n.user.displayAvatarURL?.(),
+    }, beforeDate, afterDate);
+  }
+
+  // Server boost change detection. The `premiumSince` timestamp is the
+  // only signal Discord exposes for boosts.
+  const beforeBoost = o.premiumSinceTimestamp ?? null;
+  const afterBoost = n.premiumSinceTimestamp ?? null;
+  if (!beforeBoost && afterBoost) {
+    await logMemberBoostChange(client, n.guild.id, {
+      id: n.user.id,
+      tag: n.user.tag ?? n.user.username ?? n.user.id,
+      avatar: n.user.displayAvatarURL?.(),
+    }, 'start');
+  } else if (beforeBoost && !afterBoost) {
+    await logMemberBoostChange(client, n.guild.id, {
+      id: n.user.id,
+      tag: n.user.tag ?? n.user.username ?? n.user.id,
+      avatar: n.user.displayAvatarURL?.(),
+    }, 'end');
+  }
+
+  // Detect avatar / banner / flag changes that aren't covered by the
+  // Discord gateway `GuildMemberUpdate` event for individual properties.
+  // We compare the `pending` flag at minimum so onboarding completion
+  // shows up in logs (these are the only consistently-available signals).
+  if ((o.pending ?? false) !== (n.pending ?? false)) {
+    const fields: EmbedField[] = [
+      { name: 'Before', value: `\`${o.pending ? 'pending' : 'verified'}\``, inline: true },
+      { name: 'After',  value: `\`${n.pending ? 'pending' : 'verified'}\``, inline: true },
+    ];
+    await logEvent({
+      client,
+      guildId: n.guild.id,
+      category: 'member',
+      title: 'Member onboarding state changed',
+      description: `<@${n.user.id}> is now ${n.pending ? 'pending' : 'verified'}.`,
+      actor: { id: n.user.id, tag: n.user.tag ?? n.user.id },
+      target: { id: n.user.id, tag: n.user.tag ?? n.user.id },
+      fields,
+    });
   }
 }
 
-async function onGuildCreate(g: any, client: any): Promise<void> {
+// ============================================================================
+// Ban events
+// ============================================================================
+
+async function onGuildBanAdd(ban: any, client: any): Promise<void> {
+  if (!ban.guild) return;
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: ban.guild,
+      action: [AuditLogEvent.MemberBanAdd],
+      targetId: ban.user?.id,
+      maxAgeMs: 30_000,
+      limit: 5,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
+  await logBanAdd(client, ban.guild.id, ban, executor, reason);
+}
+
+async function onGuildBanRemove(ban: any, client: any): Promise<void> {
+  if (!ban.guild) return;
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: ban.guild,
+      action: [AuditLogEvent.MemberBanRemove],
+      targetId: ban.user?.id,
+      maxAgeMs: 30_000,
+      limit: 5,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
+  await logBanRemove(client, ban.guild.id, ban, executor, reason);
+}
+
+// ============================================================================
+// Guild lifecycle
+// ============================================================================
+
+async function onGuildCreate(g: any): Promise<void> {
   getDatabase().prepare('INSERT OR IGNORE INTO guild_settings (guild_id, prefix, panic_mode, created_at, updated_at) VALUES (?, ?, 0, ?, ?)').run(g.id, '.', Date.now(), Date.now());
 }
+
+/**
+ * Log guild-level changes that aren't covered by other event handlers
+ * (name, icon, banner, verification, default notifications, MFA, etc.).
+ */
+async function onGuildUpdate(o: Guild, n: Guild, client: any): Promise<void> {
+  const changes: string[] = [];
+  if (o.name !== n.name) {
+    changes.push(`Name: \`${o.name}\` → \`${n.name}\``);
+  }
+  if (o.icon !== n.icon) {
+    changes.push(`Icon: \`${o.icon ?? 'none'}\` → \`${n.icon ?? 'none'}\``);
+  }
+  if (o.banner !== n.banner) {
+    changes.push(`Banner changed`);
+  }
+  if (o.verificationLevel !== n.verificationLevel) {
+    changes.push(`Verification: \`${o.verificationLevel}\` → \`${n.verificationLevel}\``);
+  }
+  if (o.defaultMessageNotifications !== n.defaultMessageNotifications) {
+    changes.push(`Default notifications: \`${o.defaultMessageNotifications}\` → \`${n.defaultMessageNotifications}\``);
+  }
+  if (o.mfaLevel !== n.mfaLevel) {
+    changes.push(`MFA: \`${o.mfaLevel}\` → \`${n.mfaLevel}\``);
+  }
+  if (o.premiumTier !== n.premiumTier) {
+    changes.push(`Boost tier: \`${o.premiumTier}\` → \`${n.premiumTier}\``);
+  }
+  if (o.afkTimeout !== n.afkTimeout) {
+    changes.push(`AFK timeout: \`${o.afkTimeout}s\` → \`${n.afkTimeout}s\``);
+  }
+
+  if (!changes.length) return; // Nothing material to report.
+
+  // Attribute to the audit log so we surface the responsible moderator.
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: n,
+      action: AuditLogEvent.GuildUpdate,
+      targetId: n.id,
+      maxAgeMs: 30_000,
+      limit: 10,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
+
+  const fields: EmbedField[] = [
+    { name: '🔄 Changes', value: changes.map((c) => `• ${c}`).join('\n').slice(0, 1024), inline: false },
+  ];
+  if (reason) fields.push({ name: '📝 Reason', value: truncate(reason, 512), inline: false });
+
+  await logEvent({
+    client,
+    guildId: n.id,
+    category: 'server',
+    title: 'Server settings updated',
+    description: executor ? `${executor.tag} updated server settings.` : `Server settings were updated.`,
+    actor: executor,
+    target: { id: n.id, tag: n.name },
+    fields,
+  });
+}
+
+/**
+ * Lightweight audit-log listener. Discord already fires other events
+ * for the common changes, but this hook provides a fallback for action
+ * types that don't have a dedicated gateway event (e.g. invite updates).
+ */
+async function onAuditLogEntry(entry: GuildAuditLogsEntry, guild: Guild, client: any): Promise<void> {
+  if (!entry.executor) return;
+  const executor: ActorInfo = {
+    id: entry.executor.id,
+    tag: entry.executor.tag ?? entry.executor.username ?? entry.executor.id,
+    avatar: entry.executor.displayAvatarURL?.(),
+  };
+
+  // Invite updates don't have a dedicated gateway event, so we
+  // surface them via the audit-log stream.
+  if (entry.action === AuditLogEvent.InviteUpdate) {
+    await logEvent({
+      client,
+      guildId: guild.id,
+      category: 'moderation',
+      title: 'Invite updated',
+      description: `${executor.tag} updated an invite.`,
+      actor: executor,
+      target: entry.targetId ? { id: entry.targetId, tag: entry.targetId } : null,
+      reason: entry.reason,
+      fields: entry.changes?.length
+        ? [{ name: '🔄 Changes', value: entry.changes.map((c) => `\`${c.key}\``).join(', ').slice(0, 1024), inline: false }]
+        : undefined,
+    });
+  }
+}
+
+// ============================================================================
+// Voice
+// ============================================================================
 
 async function onVoiceStateUpdate(_o: any, n: any, client: any): Promise<void> {
   const member = n.member;
@@ -389,147 +785,281 @@ async function onVoiceStateUpdate(_o: any, n: any, client: any): Promise<void> {
   await logEvent({ guildId: member.guild.id, category: 'voice', title: n.channelId ? 'Voice joined' : 'Voice left', description: n.channel ? `<#${n.channel.id}>` : 'Disconnected', author: { id: member.id, tag: member.user.tag, avatar: member.user.displayAvatarURL() }, client });
 }
 
-async function onChannelChange(channel: any, action: string, client: any): Promise<void> {
+// ============================================================================
+// Channel events
+// ============================================================================
+
+async function onChannelChange(channel: GuildChannel, action: 'create' | 'delete', _unused: any, client: any): Promise<void> {
   if (!channel.guild) return;
 
-  // Audit log fetch for antinuke attribution.
-  const audit = await channel.guild.fetchAuditLogs({ type: action === 'channel_create' ? AuditLogEvent.ChannelCreate : AuditLogEvent.ChannelDelete, limit: 1 }).catch(() => null);
-  const entry = audit?.entries.first();
-  const executorId = entry?.executorId ?? null;
-  const executorMember = executorId ? await channel.guild.members.fetch(executorId).catch(() => null) : null;
+  const auditAction =
+    action === 'create' ? AuditLogEvent.ChannelCreate :
+    AuditLogEvent.ChannelDelete;
 
-  if (getAntinukeConfig(channel.guild.id).enabled) {
-    if (executorId) {
-      const isOwner = channel.guild.ownerId === executorId;
-      const isBot = client.user?.id === executorId;
-      const roleIds: string[] = executorMember ? executorMember.roles.cache.map((r: { id: string }) => r.id) : [];
-      const whitelisted = isWhitelistedWithRoles(channel.guild.id, executorId, roleIds);
-      if (!isOwner && !isBot && !whitelisted) {
-        const triggered = trackAntinukeEvent(channel.guild.id, executorId, action);
-        if (triggered) {
-          try { await channel.guild.members.ban(executorId, { reason: `Antinuke: ${action} threshold` }); } catch {}
-          await logEvent({
-            guildId: channel.guild.id,
-            category: 'security',
-            title: `Antinuke triggered — ${action === 'channel_create' ? 'Channel creation' : 'Channel deletion'} spam`,
-            description: `${entry.executorId} exceeded the ${action} threshold within the window. Punishment: **ban**`,
-            fields: [
-              { name: 'Channel', value: (channel as any).name ?? 'unknown', inline: true },
-              { name: 'Action type', value: action, inline: true },
-              { name: 'Punishment', value: '`ban`', inline: true },
-            ],
-            author: executorMember ? { id: executorMember.id, tag: executorMember.user?.tag ?? executorMember.id, avatar: executorMember.user?.displayAvatarURL?.() } : { id: executorId, tag: 'Unknown' },
-            client,
-            risk: 'HIGH',
-          });
-        }
-      }
-    }
-  }
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: channel.guild,
+      action: auditAction,
+      targetId: channel.id,
+      maxAgeMs: 30_000,
+      limit: 5,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
 
-  // General channel event log (always fires, even if antinuke didn't trigger).
-  await logEvent({
-    guildId: channel.guild.id,
-    category: 'channel',
-    title: action === 'channel_create' ? 'Channel created' : 'Channel deleted',
-    description: (channel as any).name ?? '',
-    fields: [{ name: 'Channel type', value: String(channel.type), inline: true }],
-    author: executorMember
-      ? { id: executorMember.id, tag: executorMember.user?.tag ?? executorMember.id, avatar: executorMember.user?.displayAvatarURL?.() }
-      : executorId
-      ? { id: executorId, tag: 'Unknown' }
-      : null,
-    client,
-  });
-}
-
-async function onRoleChange(role: any, action: string, client: any): Promise<void> {
-  if (!role.guild) return;
-
-  const audit = await role.guild.fetchAuditLogs({ type: action === 'role_create' ? AuditLogEvent.RoleCreate : AuditLogEvent.RoleDelete, limit: 1 }).catch(() => null);
-  const entry = audit?.entries.first();
-  const executorId = entry?.executorId ?? null;
-  const executorMember = executorId ? await role.guild.members.fetch(executorId).catch(() => null) : null;
-
-  if (getAntinukeConfig(role.guild.id).enabled && executorId) {
-    const isOwner = role.guild.ownerId === executorId;
-    const isBot = client.user?.id === executorId;
-    const roleIds: string[] = executorMember ? executorMember.roles.cache.map((r: { id: string }) => r.id) : [];
-    const whitelisted = isWhitelistedWithRoles(role.guild.id, executorId, roleIds);
+  // Antinuke attribution.
+  if (getAntinukeConfig(channel.guild.id).enabled && executor?.id) {
+    const executorMember = await channel.guild.members.fetch(executor.id).catch(() => null);
+    const isOwner = channel.guild.ownerId === executor.id;
+    const isBot = client.user?.id === executor.id;
+    const roleIds: string[] = executorMember ? executorMember.roles.cache.map((r: Role) => r.id) : [];
+    const whitelisted = isWhitelistedWithRoles(channel.guild.id, executor.id, roleIds);
     if (!isOwner && !isBot && !whitelisted) {
-      const triggered = trackAntinukeEvent(role.guild.id, executorId, action);
+      const triggered = trackAntinukeEvent(channel.guild.id, executor.id, action === 'create' ? 'channel_create' : 'channel_delete');
       if (triggered) {
-        try { await role.guild.members.ban(executorId, { reason: `Antinuke: ${action} threshold` }); } catch {}
+        try { await channel.guild.members.ban(executor.id, { reason: `Antinuke: ${action} threshold` }); } catch {}
         await logEvent({
-          guildId: role.guild.id,
+          guildId: channel.guild.id,
           category: 'security',
-          title: `Antinuke triggered — ${action === 'role_create' ? 'Role creation' : 'Role deletion'} spam`,
-          description: `${executorId} exceeded the ${action} threshold. Punishment: **ban**`,
+          title: `Antinuke triggered — Channel ${action} spam`,
+          description: `${executor.tag} exceeded the ${action} threshold within the window. Punishment: **ban**`,
           fields: [
-            { name: 'Role', value: role.name, inline: true },
+            { name: 'Channel', value: (channel as any).name ?? 'unknown', inline: true },
             { name: 'Action type', value: action, inline: true },
             { name: 'Punishment', value: '`ban`', inline: true },
           ],
-          author: executorMember ? { id: executorMember.id, tag: executorMember.user?.tag ?? executorMember.id, avatar: executorMember.user?.displayAvatarURL?.() } : { id: executorId, tag: 'Unknown' },
+          author: executor,
           client,
           risk: 'HIGH',
         });
       }
     }
   }
-  await logEvent({
-    guildId: role.guild.id,
-    category: 'role',
-    title: action === 'role_create' ? 'Role created' : 'Role deleted',
-    description: role.name,
-    fields: [
-      { name: 'Color', value: String(role.hexColor ?? 'default'), inline: true },
-      { name: 'Mentionable', value: role.mentionable ? 'Yes' : 'No', inline: true },
-    ],
-    author: executorMember
-      ? { id: executorMember.id, tag: executorMember.user?.tag ?? executorMember.id, avatar: executorMember.user?.displayAvatarURL?.() }
-      : executorId
-      ? { id: executorId, tag: 'Unknown' }
-      : null,
-    client,
+
+  await logChannelEvent(client, channel.guild.id, {
+    action,
+    channel,
+    executor,
+    reason,
   });
 }
 
-async function onWebhookUpdate(channel: any, client: any): Promise<void> {
-  if (!channel.guild) return;
-  if (!getAntinukeConfig(channel.guild.id).enabled) return;
-  const audit = await channel.guild.fetchAuditLogs({ type: AuditLogEvent.WebhookCreate, limit: 5 }).catch(() => null);
-  for (const entry of audit?.entries.values() ?? []) {
-    if (!entry.executorId) continue;
-    const executorMember = await channel.guild.members.fetch(entry.executorId).catch(() => null);
-    const isOwner = channel.guild.ownerId === entry.executorId;
-    const isBot = client.user?.id === entry.executorId;
-    const roleIds: string[] = executorMember ? executorMember.roles.cache.map((r: { id: string }) => r.id) : [];
-    const whitelisted = isWhitelistedWithRoles(channel.guild.id, entry.executorId, roleIds);
-    if (isOwner || isBot || whitelisted) continue;
-    const triggered = trackAntinukeEvent(channel.guild.id, entry.executorId, 'webhook_create');
-    if (triggered) {
-      try { await channel.guild.members.ban(entry.executorId, { reason: 'Antinuke: webhook spam' }); } catch {}
-      await logEvent({
-        guildId: channel.guild.id,
-        category: 'security',
-        title: 'Antinuke triggered — Webhook spam',
-        description: `${entry.executorId} created too many webhooks. Punishment: **ban**`,
-        fields: [
-          { name: 'Action type', value: '`webhook_create`', inline: true },
-          { name: 'Channel', value: `<#${channel.id}>`, inline: true },
-          { name: 'Punishment', value: '`ban`', inline: true },
-        ],
-        author: executorMember
-          ? { id: executorMember.id, tag: executorMember.user?.tag ?? executorMember.id, avatar: executorMember.user?.displayAvatarURL?.() }
-          : { id: entry.executorId, tag: 'Unknown' },
-        client,
-        risk: 'HIGH',
-      });
-      break;
+async function onChannelUpdate(o: GuildChannel, n: GuildChannel, client: any): Promise<void> {
+  if (!n.guild) return;
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: n.guild,
+      action: [AuditLogEvent.ChannelUpdate, AuditLogEvent.ChannelOverwriteCreate, AuditLogEvent.ChannelOverwriteUpdate, AuditLogEvent.ChannelOverwriteDelete],
+      targetId: n.id,
+      maxAgeMs: 30_000,
+      limit: 10,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
+  await logChannelEvent(client, n.guild.id, {
+    action: 'update',
+    channel: n,
+    before: o,
+    executor,
+    reason,
+  });
+}
+
+// ============================================================================
+// Role events
+// ============================================================================
+
+async function onRoleChange(role: Role, action: 'create' | 'delete', _unused: any, client: any): Promise<void> {
+  if (!role.guild) return;
+
+  const auditAction =
+    action === 'create' ? AuditLogEvent.RoleCreate :
+    AuditLogEvent.RoleDelete;
+
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: role.guild,
+      action: auditAction,
+      targetId: role.id,
+      maxAgeMs: 30_000,
+      limit: 5,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
+
+  if (getAntinukeConfig(role.guild.id).enabled && executor?.id) {
+    const executorMember = await role.guild.members.fetch(executor.id).catch(() => null);
+    const isOwner = role.guild.ownerId === executor.id;
+    const isBot = client.user?.id === executor.id;
+    const roleIds: string[] = executorMember ? executorMember.roles.cache.map((r) => r.id) : [];
+    const whitelisted = isWhitelistedWithRoles(role.guild.id, executor.id, roleIds);
+    if (!isOwner && !isBot && !whitelisted) {
+      const triggered = trackAntinukeEvent(role.guild.id, executor.id, action === 'create' ? 'role_create' : 'role_delete');
+      if (triggered) {
+        try { await role.guild.members.ban(executor.id, { reason: `Antinuke: ${action} threshold` }); } catch {}
+        await logEvent({
+          guildId: role.guild.id,
+          category: 'security',
+          title: `Antinuke triggered — Role ${action} spam`,
+          description: `${executor.tag} exceeded the ${action} threshold. Punishment: **ban**`,
+          fields: [
+            { name: 'Role', value: role.name, inline: true },
+            { name: 'Action type', value: action, inline: true },
+            { name: 'Punishment', value: '`ban`', inline: true },
+          ],
+          author: executor,
+          client,
+          risk: 'HIGH',
+        });
+      }
     }
   }
+  await logRoleEvent(client, role.guild.id, {
+    action,
+    role,
+    executor,
+    reason,
+  });
 }
+
+async function onRoleUpdate(o: Role, n: Role, client: any): Promise<void> {
+  if (!n.guild) return;
+  let executor: ActorInfo | null = null;
+  let reason: string | null = null;
+  try {
+    const audit = await resolveAuditExecutor({
+      guild: n.guild,
+      action: AuditLogEvent.RoleUpdate,
+      targetId: n.id,
+      maxAgeMs: 30_000,
+      limit: 5,
+    });
+    executor = audit.executor;
+    reason = audit.reason;
+  } catch {}
+  await logRoleEvent(client, n.guild.id, {
+    action: 'update',
+    role: n,
+    before: o,
+    executor,
+    reason,
+  });
+}
+
+// ============================================================================
+// Webhooks
+// ============================================================================
+
+async function onWebhookUpdate(channel: any, client: any): Promise<void> {
+  if (!channel.guild) return;
+  // WebhooksUpdate does NOT tell us which webhook action happened or
+  // even WHICH webhook — Discord just pings the channel. We have to
+  // cross-reference the audit log and emit one log row per recent
+  // matching entry that targets this channel.
+  //
+  // We make a single audit-log fetch and bucket the entries by action
+  // type, so we don't spam the log when no webhook event has actually
+  // happened (e.g. when WebhooksUpdate fires for an unrelated reason).
+  let audit;
+  try {
+    audit = await channel.guild.fetchAuditLogs({
+      limit: 25,
+    });
+  } catch {
+    return; // No audit access — silently skip.
+  }
+  if (!audit) return;
+
+  // Filter to recent entries (30s) that target this channel.
+  const now = Date.now();
+  const recent = audit.entries.filter((entry: GuildAuditLogsEntry) => {
+    const ts = typeof entry.createdTimestamp === 'number'
+      ? entry.createdTimestamp
+      : new Date(entry.createdTimestamp as any).getTime();
+    if (now - ts > 30_000) return false;
+
+    if (entry.action === AuditLogEvent.WebhookCreate
+      || entry.action === AuditLogEvent.WebhookUpdate
+      || entry.action === AuditLogEvent.WebhookDelete) {
+      // The audit entry's `extra.channel.id` carries the channel ID
+      // for webhook actions.
+      const extraChannel = (entry.extra as any)?.channel?.id;
+      if (extraChannel === channel.id) return true;
+      // Fallback: if the webhook itself targets this channel via
+      // webhook.channelId we'd need a fetch — keep the extra-channel
+      // match as the primary signal.
+    }
+    return false;
+  });
+
+  if (!recent.size) return; // Nothing to log.
+
+  for (const entry of recent.values()) {
+    const action: 'create' | 'update' | 'delete' =
+      entry.action === AuditLogEvent.WebhookCreate ? 'create'
+      : entry.action === AuditLogEvent.WebhookDelete ? 'delete'
+      : 'update';
+
+    let executor: ActorInfo | null = null;
+    if (entry.executor) {
+      executor = {
+        id: entry.executor.id,
+        tag: entry.executor.tag ?? entry.executor.username ?? entry.executor.id,
+        avatar: entry.executor.displayAvatarURL?.(),
+      };
+    }
+
+    // Antinuke: webhook-create spam.
+    if (action === 'create' && executor?.id && getAntinukeConfig(channel.guild.id).enabled) {
+      const executorMember = await channel.guild.members.fetch(executor.id).catch(() => null);
+      const isOwner = channel.guild.ownerId === executor.id;
+      const isBot = client.user?.id === executor.id;
+      const roleIds: string[] = executorMember ? executorMember.roles.cache.map((r: Role) => r.id) : [];
+      const whitelisted = isWhitelistedWithRoles(channel.guild.id, executor.id, roleIds);
+      if (!isOwner && !isBot && !whitelisted) {
+        const triggered = trackAntinukeEvent(channel.guild.id, executor.id, 'webhook_create');
+        if (triggered) {
+          try { await channel.guild.members.ban(executor.id, { reason: 'Antinuke: webhook spam' }); } catch {}
+          await logEvent({
+            guildId: channel.guild.id,
+            category: 'security',
+            title: 'Antinuke triggered — Webhook spam',
+            description: `${executor.tag} created too many webhooks. Punishment: **ban**`,
+            fields: [
+              { name: 'Action type', value: '`webhook_create`', inline: true },
+              { name: 'Channel', value: `<#${channel.id}>`, inline: true },
+              { name: 'Punishment', value: '`ban`', inline: true },
+            ],
+            author: executor,
+            client,
+            risk: 'HIGH',
+          });
+        }
+      }
+    }
+
+    await logWebhookEvent(client, channel.guild.id, {
+      action,
+      channelId: channel.id,
+      webhookId: entry.targetId ?? null,
+      executor,
+      reason: entry.reason ?? null,
+    });
+  }
+}
+
+// ============================================================================
+// Interactions
+// ============================================================================
 
 async function onInteraction(i: any, client: any): Promise<void> {
   if (!i.isButton() && !i.isStringSelectMenu()) return;
@@ -582,3 +1112,6 @@ async function onInteraction(i: any, client: any): Promise<void> {
     return;
   }
 }
+
+// Avoid unused-warning linting on items that are imported for side effects.
+export const __unused = { GuildAuditLogsEntry };

@@ -1,38 +1,48 @@
 /**
- * Zabron — Logging service (Zeon-style SOC embeds).
+ * Zabron — Logging service.
  *
- * One central `logEvent()` produces a consistent, branded, structured
- * embed for every audit event the bot emits. The embed mirrors the
- * layout used by Zeon / popular Discord security bots:
+ * Provides:
+ *   - logEvent()              — central dispatcher for all event embeds.
+ *   - resolveAuditExecutor()  — reliable audit-log attribution helper that
+ *      fetches WITHOUT a hard-coded type filter (so we can match against
+ *      a list of allowed actions), matches the target ID where possible,
+ *      rejects stale entries, and falls back to "Unknown" if Discord does
+ *      not provide enough information.
+ *   - logIgnore helpers       — message-log channel ignore list.
+ *   - Centralised builders    — every embed is built through the design
+ *      system in src/embeds/builders.ts so branding stays consistent.
  *
- *   ┌─[ 🛡 ANTINUKE — Mass ban detected ]─────────────┐
- *   │ <description>                                   │
- *   │                                                │
- *   │ 👤 Actor: @user (123456789)                    │
- *   │ 🎯 Target: @victim (987654321)                 │
- *   │ 📍 Channel: #general                           │
- *   │ 🕒 Time: <discord timestamp>                   │
- *   │                                                │
- *   │ ── Additional context fields ──                │
- *   │ Case #1042  •  Threshold: 3/10s                │
- *   │ Punishment: ban                                │
- *   └────────────────────────────────────────────────┘
- *   Zabron • Event SEC-1042 • risk: HIGH
- *
- * Public API:
- *   - logEvent(opts)               — send a single log embed
- *   - buildActorInfo(member/user)  — extract {id, tag, avatar} safely
- *   - buildLogActor(member/user)   — same as buildActorInfo, kept as alias
- *   - generateEventId(category)    — produce a readable event id
- *   - sendPlain(guildId, message)  — escape hatch for plain text logs
+ * All Discord API errors, rate limits, missing permissions and missing
+ * channels are caught at every level — a logging failure NEVER crashes
+ * the underlying Discord event handler.
  */
 
-import { Client, Guild, GuildMember, User, EmbedField } from 'discord.js';
-import { EmbedBuilder } from 'discord.js';
+import {
+  Client,
+  EmbedBuilder,
+  EmbedField,
+  Guild,
+  GuildAuditLogsEntry,
+  GuildMember,
+  User,
+  AuditLogEvent,
+  GuildBan,
+  Message,
+  PartialMessage,
+  Role,
+  GuildChannel,
+} from 'discord.js';
 
-import { buildBanner, EmbedTone } from '../embeds/builders.js';
-import { getLoggingConfig } from '../db/repositories.js';
-import { LogCategory } from '../types/index.js';
+import {
+  buildBanner,
+  truncate,
+} from '../embeds/builders.js';
+import {
+  getLoggingConfig,
+  isChannelIgnoredForLogs,
+  isWebhookDeliveryEnabled,
+} from '../db/repositories.js';
+import type { LogCategory } from '../types/index.js';
 
 // ---------- Public types ----------
 
@@ -42,57 +52,42 @@ export interface ActorInfo {
   avatar?: string;
 }
 
-export type LogTone = 'brand' | 'success' | 'error' | 'warning' | 'info' | 'security' | 'moderation' | 'configuration' | 'log' | 'ticket' | 'giveaway' | 'leveling' | 'welcome' | 'help';
+export type LogTone =
+  | 'brand'
+  | 'success'
+  | 'error'
+  | 'warning'
+  | 'info'
+  | 'security'
+  | 'moderation'
+  | 'configuration'
+  | 'log'
+  | 'ticket'
+  | 'giveaway'
+  | 'leveling'
+  | 'welcome'
+  | 'help';
 
 export type LogRisk = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 
 export interface LogEventOptions {
-  /** Guild this event belongs to. */
   guildId: string;
-
-  /** Routing category — picks the configured log channel. */
   category: LogCategory;
-
-  /** Short title (e.g. "Member banned", "Antinuke triggered"). */
   title: string;
-
-  /** Optional long description, shown above the structured fields. */
   description?: string;
-
-  /** Additional context fields shown in the embed. */
   fields?: EmbedField[];
-
-  /** Person who caused / performed the action. */
   actor?: ActorInfo | GuildMember | User | null;
-
-  /**
-   * Alias for `actor` — accepted for backward compatibility with existing
-   * call sites that already use `author`.
-   */
+  /** Alias kept for backward compatibility with earlier call sites. */
   author?: ActorInfo | GuildMember | User | null;
-
-  /** Person / thing the action was applied to. */
   target?: ActorInfo | GuildMember | User | null;
-
-  /** Where the event took place (e.g. #general, voice channel). */
   channelId?: string | null;
-
-  /** Override the channel the embed is sent to. */
   channelOverride?: string;
-
-  /** Override the embed tone / color. */
   tone?: LogTone;
-
-  /** Risk indicator shown in the footer (e.g. "risk: HIGH"). */
   risk?: LogRisk;
-
-  /** Optional case / case id associated with the event. */
   caseId?: string;
-
-  /** Optional custom event id, otherwise one is generated. */
   eventId?: string;
-
-  /** Source client (used to resolve guild + send messages). */
+  /** Audit-log reason attached to the event (not the embed field). */
+  reason?: string | null;
   client: Client;
 }
 
@@ -125,11 +120,9 @@ function isUser(value: unknown): value is User {
   );
 }
 
-/**
- * Best-effort conversion of a member / user into ActorInfo so we can
- * embed it consistently regardless of the call site.
- */
-export function buildActorInfo(value: GuildMember | User | ActorInfo | null | undefined): ActorInfo | undefined {
+export function buildActorInfo(
+  value: GuildMember | User | ActorInfo | null | undefined,
+): ActorInfo | undefined {
   if (!value) return undefined;
   if (!isGuildMember(value) && !isUser(value) && 'id' in (value as any) && 'tag' in (value as any)) {
     return value as ActorInfo;
@@ -142,16 +135,11 @@ export function buildActorInfo(value: GuildMember | User | ActorInfo | null | un
     };
   }
   if (isUser(value)) {
-    return {
-      id: value.id,
-      tag: value.tag,
-      avatar: value.displayAvatarURL?.(),
-    };
+    return { id: value.id, tag: value.tag, avatar: value.displayAvatarURL?.() };
   }
   return undefined;
 }
 
-/** Alias kept for backward compatibility with earlier call sites. */
 export const buildLogActor = buildActorInfo;
 
 // ---------- Event id generator ----------
@@ -181,16 +169,7 @@ export function generateEventId(category: string): string {
   return `${prefix}-${Date.now().toString(36).slice(-4).toUpperCase()}-${eventCounter.toString().padStart(5, '0')}`;
 }
 
-// ---------- Routing ----------
-
-function resolveLogChannel(opts: LogEventOptions, guild: Guild): { channelId: string; tone: LogTone } | null {
-  const tone: LogTone = opts.tone ?? toneForCategory(opts.category);
-  if (opts.channelOverride) return { channelId: opts.channelOverride, tone };
-
-  const cfg = getLoggingConfig(opts.guildId, opts.category);
-  if (!cfg.enabled || !cfg.channelId) return null;
-  return { channelId: cfg.channelId, tone };
-}
+// ---------- Routing & tone ----------
 
 function toneForCategory(category: LogCategory): LogTone {
   switch (category) {
@@ -199,54 +178,198 @@ function toneForCategory(category: LogCategory): LogTone {
       return 'security';
     case 'moderation':
       return 'moderation';
-    case 'member':
-    case 'message':
-    case 'role':
-    case 'channel':
-    case 'voice':
-    case 'server':
-      return 'log';
     case 'tickets':
       return 'ticket';
     case 'giveaways':
       return 'giveaway';
     case 'leveling':
       return 'leveling';
+    case 'message':
+    case 'member':
+    case 'role':
+    case 'channel':
+    case 'webhook':
+    case 'voice':
+    case 'server':
+    case 'general':
     default:
       return 'log';
   }
 }
 
-// ---------- Embed assembly ----------
-
-function timestamp(d?: number | Date): number {
-  if (d instanceof Date) return d.getTime();
-  if (typeof d === 'number') return d;
-  return Date.now();
+function resolveLogChannel(
+  opts: LogEventOptions,
+): { channelId: string; tone: LogTone } | null {
+  const tone: LogTone = opts.tone ?? toneForCategory(opts.category);
+  if (opts.channelOverride) return { channelId: opts.channelOverride, tone };
+  const cfg = getLoggingConfig(opts.guildId, opts.category);
+  if (!cfg.enabled || !cfg.channelId) return null;
+  return { channelId: cfg.channelId, tone };
 }
+
+// ---------- Audit log attribution ----------
+
+/**
+ * Options accepted by {@link resolveAuditExecutor}.
+ */
+export interface ResolveAuditOptions {
+  /** The guild whose audit log should be searched. */
+  guild: Guild;
+  /**
+   * The Discord audit-log action type we are looking for (e.g.
+   * `AuditLogEvent.MemberRoleUpdate`). Multiple types can be supplied so
+   * we can cover related actions (e.g. `MemberBanAdd`).
+   */
+  action: AuditLogEvent | AuditLogEvent[];
+  /**
+   * Target ID to match against the audit entry's target, when known.
+   * When `null` or omitted, target ID is NOT checked (best-effort match).
+   */
+  targetId?: string | null;
+  /**
+   * Maximum age of the audit entry in milliseconds. Discord audit logs
+   * are eventually pruned by Discord itself; we use a 30-second window by
+   * default which is large enough to cover API latency but small enough
+   * to avoid attributing stale actions.
+   */
+  maxAgeMs?: number;
+  /** Limit of entries to fetch. Defaults to 25. */
+  limit?: number;
+  /**
+   * Optional secondary target ID for webhook attribution: many
+   * webhook-create audit entries set BOTH a webhook target and the
+   * channel. We accept either when both are supplied.
+   */
+  channelId?: string | null;
+}
+
+export interface AuditResolution {
+  executorId: string | null;
+  executor: ActorInfo | null;
+  reason: string | null;
+  entry: GuildAuditLogsEntry | null;
+}
+
+/**
+ * Reliable audit-log executor resolver.
+ *
+ * Why we can't just take `entries.first()`:
+ *   - The newest audit entry on the guild may belong to a *different*
+ *     action that happened just before the one we're trying to attribute.
+ *     Discord buckets all actions into a single rolling log; without
+ *     filtering we frequently attribute the wrong user.
+ *   - Discord's audit log target field is sometimes the user, sometimes
+ *     a channel/role/etc. We only match on target when the caller
+ *     explicitly supplies `targetId`.
+ *   - Rate-limit errors and "Unknown Guild / Unknown Audit Log" failures
+ *     happen frequently; we swallow them so the calling event handler
+ *     can continue processing the underlying Discord event.
+ *
+ * Behaviour:
+ *   1. Fetch `limit` recent entries WITHOUT a type filter so we get a
+ *      wide slice of the audit log (Discord paginates from newest to
+ *      oldest, so the most recent events are at the start).
+ *   2. For each entry, check:
+ *        a. `action` matches one of the requested action types.
+ *        b. If `targetId` was supplied, the entry's target matches it
+ *           (or the entry's channel target matches `channelId`).
+ *        c. `now - entry.createdTimestamp <= maxAgeMs` (default 30s).
+ *   3. Return the first matching entry's executor, plus the entry and
+ *      reason. Falls back to `{ executorId: null, executor: null }` when
+ *      nothing matches.
+ *
+ * Discord API failures are caught and the function never throws.
+ */
+export async function resolveAuditExecutor(
+  opts: ResolveAuditOptions,
+): Promise<AuditResolution> {
+  const actions = Array.isArray(opts.action) ? opts.action : [opts.action];
+  const maxAge = opts.maxAgeMs ?? 30_000;
+  const limit = opts.limit ?? 25;
+  const now = Date.now();
+
+  let audit;
+  try {
+    // Fetch WITHOUT a `type` filter so we can match against any of the
+    // allowed actions in one pass. Discord orders entries newest-first.
+    audit = await opts.guild.fetchAuditLogs({ limit });
+  } catch {
+    // Rate limit, missing VIEW_AUDIT_LOG permission, etc. — never throw.
+    return { executorId: null, executor: null, reason: null, entry: null };
+  }
+
+  if (!audit) return { executorId: null, executor: null, reason: null, entry: null };
+
+  for (const entry of audit.entries.values()) {
+    // Type must match at least one of the requested actions.
+    if (!actions.includes(entry.action)) continue;
+
+    // Target must match (when supplied). For webhooks we also accept a
+    // channel match because Discord reports the webhook target ID but
+    // the action's "extra.channel" object also carries the channel ID.
+    if (opts.targetId) {
+      const targetMatches = entry.targetId === opts.targetId;
+      const channelMatches = !!opts.channelId && (
+        (entry.extra && (entry.extra as any).channel && (entry.extra as any).channel.id === opts.channelId)
+      );
+      if (!targetMatches && !channelMatches) continue;
+    }
+
+    // Reject stale entries. Discord audits can lag behind the event by
+    // a few seconds under load, but anything older than the configured
+    // window almost certainly belongs to an unrelated previous action.
+    const ts = typeof entry.createdTimestamp === 'number'
+      ? entry.createdTimestamp
+      : new Date(entry.createdTimestamp as any).getTime();
+    const age = now - ts;
+    if (age > maxAge) continue;
+
+    // We have a winner — extract actor info.
+    const executor = entry.executor;
+    if (!executor) {
+      return { executorId: null, executor: null, reason: entry.reason ?? null, entry };
+    }
+    return {
+      executorId: executor.id,
+      executor: {
+        id: executor.id,
+        tag: executor.tag ?? executor.username ?? executor.id,
+        avatar: executor.displayAvatarURL?.(),
+      },
+      reason: entry.reason ?? null,
+      entry,
+    };
+  }
+
+  return { executorId: null, executor: null, reason: null, entry: null };
+}
+
+/**
+ * Safely fetch a single message, returning `null` on any failure.
+ * Use this in logging paths so a missing/partial message can never
+ * crash the underlying event handler.
+ */
+export async function safeFetchMessage(m: Message | PartialMessage): Promise<Message | null> {
+  if (!m.partial) return m as Message;
+  try {
+    return await m.fetch();
+  } catch {
+    return null;
+  }
+}
+
+// ---------- Embed assembly ----------
 
 function fmtTime(d: number | Date): string {
   const date = d instanceof Date ? d : new Date(d);
   return `<t:${Math.floor(date.getTime() / 1000)}:F> (<t:${Math.floor(date.getTime() / 1000)}:R>)`;
 }
 
-/**
- * Assemble the final embed. Layout (Zeon-style):
- *  - title with severity emoji
- *  - description
- *  - "Actor" / "Target" / "Channel" / "Time" struct fields
- *  - any caller-supplied fields
- *  - footer with case id, event id, and risk indicator
- */
-export function buildLogEmbed(opts: LogEventOptions, eventId: string, now: number): EmbedBuilder {
-  // Resolve `author` alias for backward compat.
-  const resolved = { ...opts, actor: opts.actor ?? opts.author };
-  const fields: EmbedField[] = [];
-  const tone = resolved.tone ?? toneForCategory(resolved.category);
-
-  // Actor — only if known. Plain systems (e.g. RAID) are still attributed
-  // to "Unknown" so the row is auditable rather than dropped.
-  const actor = buildActorInfo(resolved.actor ?? undefined);
+function addActorField(
+  fields: EmbedField[],
+  actor: ActorInfo | null | undefined,
+  explicitNull: boolean,
+): void {
   if (actor) {
     const avatar = actor.avatar ? actor.avatar : undefined;
     fields.push({
@@ -254,38 +377,60 @@ export function buildLogEmbed(opts: LogEventOptions, eventId: string, now: numbe
       value: `<@${actor.id}>\n\`${actor.tag}\` • \`${actor.id}\`${avatar ? `\n[avatar](${avatar})` : ''}`,
       inline: true,
     });
-  } else if (resolved.actor === null) {
+  } else if (explicitNull) {
     fields.push({ name: '👤 Actor', value: '`Unknown` (no executor resolved)', inline: true });
   }
+}
 
-  // Target — independent of actor.
-  const target = buildActorInfo(resolved.target ?? undefined);
-  if (target) {
-    const avatar = target.avatar ? target.avatar : undefined;
-    fields.push({
-      name: '🎯 Target',
-      value: `<@${target.id}>\n\`${target.tag}\` • \`${target.id}\`${avatar ? `\n[avatar](${avatar})` : ''}`,
-      inline: true,
-    });
-  }
+function addTargetField(fields: EmbedField[], target: ActorInfo | null | undefined): void {
+  if (!target) return;
+  const avatar = target.avatar ? target.avatar : undefined;
+  fields.push({
+    name: '🎯 Target',
+    value: `<@${target.id}>\n\`${target.tag}\` • \`${target.id}\`${avatar ? `\n[avatar](${avatar})` : ''}`,
+    inline: true,
+  });
+}
 
-  // Channel + Time
-  if (resolved.channelId) {
-    fields.push({ name: '📍 Channel', value: `<#${resolved.channelId}>`, inline: true });
+function addChannelField(fields: EmbedField[], channelId: string | null | undefined): void {
+  if (!channelId) return;
+  fields.push({ name: '📍 Channel', value: `<#${channelId}>`, inline: true });
+}
+
+function addCaseAndRisk(
+  fields: EmbedField[],
+  caseId: string | undefined,
+  risk: LogRisk | undefined,
+): void {
+  if (caseId) fields.push({ name: '📂 Case', value: `\`${caseId}\``, inline: true });
+  if (risk) {
+    const riskEmoji = risk === 'CRITICAL' ? '🚨' : risk === 'HIGH' ? '🟥' : risk === 'MEDIUM' ? '🟧' : '🟩';
+    fields.push({ name: '⚠️ Risk', value: `${riskEmoji} \`${risk}\``, inline: true });
   }
+}
+
+export function buildLogEmbed(opts: LogEventOptions, eventId: string, now: number): EmbedBuilder {
+  // Resolve actor and target. `null` (explicit "Unknown") must survive
+  // the nullish-coalescing chain — only `undefined` falls back to the
+  // legacy `author` alias.
+  const resolvedActor =
+    opts.actor !== undefined ? opts.actor : (opts.author !== undefined ? opts.author : undefined);
+  const resolved = { ...opts, actor: resolvedActor };
+
+  const fields: EmbedField[] = [];
+  const tone: LogTone = resolved.tone ?? toneForCategory(resolved.category);
+
+  addActorField(
+    fields,
+    buildActorInfo(resolved.actor ?? undefined),
+    resolved.actor === null || resolved.actor === undefined,
+  );
+  addTargetField(fields, buildActorInfo(resolved.target ?? undefined));
+  addChannelField(fields, resolved.channelId ?? undefined);
   fields.push({ name: '🕒 Time', value: fmtTime(now), inline: false });
+  addCaseAndRisk(fields, resolved.caseId, resolved.risk);
 
-  if (resolved.caseId) {
-    fields.push({ name: '📂 Case', value: `\`${resolved.caseId}\``, inline: true });
-  }
-  if (resolved.risk) {
-    const riskEmoji = resolved.risk === 'CRITICAL' ? '🚨' : resolved.risk === 'HIGH' ? '🟥' : resolved.risk === 'MEDIUM' ? '🟧' : '🟩';
-    fields.push({ name: '⚠️ Risk', value: `${riskEmoji} \`${resolved.risk}\``, inline: true });
-  }
-
-  if (resolved.fields && resolved.fields.length) {
-    fields.push(...resolved.fields);
-  }
+  if (resolved.fields && resolved.fields.length) fields.push(...resolved.fields);
 
   return buildBanner({
     title: resolved.title,
@@ -299,20 +444,33 @@ export function buildLogEmbed(opts: LogEventOptions, eventId: string, now: numbe
 // ---------- Main entry point ----------
 
 /**
- * Build and dispatch a Zeon-style log embed.
+ * Send a log event to the configured channel for its category.
  *
- * Failure modes are swallowed and returned as `{ ok: false, reason }` so
- * logging itself never crashes the calling command/event.
+ * Failure modes (all return `{ ok: false, reason }` instead of throwing):
+ *   - Guild not found
+ *   - No log channel configured for the category
+ *   - Webhook delivery disabled for the category
+ *   - Log channel missing / deleted / not text-based
+ *   - Discord API error (rate limit, missing permissions, network)
+ *
+ * Returns `{ ok: true, channelId, eventId }` on success.
  */
 export async function logEvent(opts: LogEventOptions): Promise<SendResult> {
   const eventId = opts.eventId ?? generateEventId(opts.category);
-  const now = timestamp();
+  const now = Date.now();
   try {
-    const guild = opts.client.guilds?.cache?.get(opts.guildId) ?? (await opts.client.guilds?.fetch(opts.guildId).catch(() => null));
+    const guild =
+      opts.client.guilds?.cache?.get(opts.guildId) ??
+      (await opts.client.guilds?.fetch(opts.guildId).catch(() => null));
     if (!guild) return { ok: false, eventId, reason: 'Guild not found' };
 
-    const route = resolveLogChannel(opts, guild);
+    const route = resolveLogChannel(opts);
     if (!route) return { ok: false, eventId, reason: 'No log channel configured' };
+
+    // Webhook delivery toggles live alongside the regular channel config.
+    if (!isWebhookDeliveryEnabled(opts.guildId, opts.category)) {
+      return { ok: false, eventId, reason: 'Webhook delivery disabled for category' };
+    }
 
     const channel = await guild.channels.fetch(route.channelId).catch(() => null);
     if (!channel || !('send' in (channel as any))) {
@@ -327,20 +485,28 @@ export async function logEvent(opts: LogEventOptions): Promise<SendResult> {
       });
     }
 
-    await (channel as any).send({ embeds: [embed], allowedMentions: { parse: [] } });
+    await (channel as any).send({
+      embeds: [embed],
+      allowedMentions: { parse: [] },
+    });
     return { ok: true, channelId: route.channelId, eventId };
   } catch (err) {
     return { ok: false, eventId, reason: (err as Error).message };
   }
 }
 
-/**
- * Plain text log for low-noise housekeeping events (e.g. cache warmup,
- * unknown actor notices). Routes via the same channel config as logEvent.
- */
-export async function sendPlain(guildId: string, category: LogCategory, content: string, client: Client): Promise<SendResult> {
+// ---------- Plain text escape hatch ----------
+
+export async function sendPlain(
+  guildId: string,
+  category: LogCategory,
+  content: string,
+  client: Client,
+): Promise<SendResult> {
   const cfg = getLoggingConfig(guildId, category);
-  if (!cfg.enabled || !cfg.channelId) return { ok: false, eventId: '-', reason: 'No log channel configured' };
+  if (!cfg.enabled || !cfg.channelId) {
+    return { ok: false, eventId: '-', reason: 'No log channel configured' };
+  }
   try {
     const guild = client.guilds.cache.get(guildId) ?? (await client.guilds.fetch(guildId).catch(() => null));
     if (!guild) return { ok: false, eventId: '-', reason: 'Guild not found' };
@@ -353,20 +519,13 @@ export async function sendPlain(guildId: string, category: LogCategory, content:
   }
 }
 
-/**
- * Convenience wrapper for events without a guild context but where the
- * caller still wants the structured embed (e.g. moderation cases).
- */
+// ---------- High-level wrapper ----------
+
 export function buildLogEmbedStandalone(opts: LogEventOptions): EmbedBuilder {
   const eventId = opts.eventId ?? generateEventId(opts.category);
-  return buildLogEmbed(opts, eventId, timestamp());
+  return buildLogEmbed(opts, eventId, Date.now());
 }
 
-/**
- * Used by the moderation case listing to render rows in a "who did
- * what to whom" format. Kept here so every log surface shares the same
- * vocabulary.
- */
 export function buildCaseRow(opts: {
   action: string;
   reason?: string | null;
@@ -386,5 +545,592 @@ export function buildCaseRow(opts: {
   };
 }
 
+// ---------- High-level event helpers ----------
+
+/**
+ * Render a member join event with consistent formatting.
+ */
+export async function logMemberJoin(
+  client: Client,
+  guildId: string,
+  user: { id: string; tag: string; avatar?: string; createdTimestamp?: number },
+): Promise<SendResult> {
+  const fields: EmbedField[] = [];
+  if (typeof user.createdTimestamp === 'number') {
+    const ageDays = (Date.now() - user.createdTimestamp) / 86_400_000;
+    fields.push({ name: '🆔 Account age', value: `\`${ageDays.toFixed(1)}d\``, inline: true });
+  }
+  fields.push({ name: '👤 User ID', value: `\`${user.id}\``, inline: true });
+  return logEvent({
+    client,
+    guildId,
+    category: 'member',
+    title: 'Member joined',
+    description: `${user.tag} joined the server.`,
+    actor: { id: user.id, tag: user.tag, avatar: user.avatar },
+    fields,
+  });
+}
+
+export async function logMemberLeave(
+  client: Client,
+  guildId: string,
+  user: { id: string; tag: string; avatar?: string },
+): Promise<SendResult> {
+  return logEvent({
+    client,
+    guildId,
+    category: 'member',
+    title: 'Member left',
+    description: `${user.tag} left the server.`,
+    actor: { id: user.id, tag: user.tag, avatar: user.avatar },
+    fields: [{ name: '👤 User ID', value: `\`${user.id}\``, inline: true }],
+  });
+}
+
+export async function logMemberNicknameChange(
+  client: Client,
+  guildId: string,
+  user: { id: string; tag: string; avatar?: string },
+  before: string | null,
+  after: string | null,
+): Promise<SendResult> {
+  return logEvent({
+    client,
+    guildId,
+    category: 'member',
+    title: 'Nickname changed',
+    description: `${user.tag} updated their nickname.`,
+    actor: { id: user.id, tag: user.tag, avatar: user.avatar },
+    target: { id: user.id, tag: user.tag, avatar: user.avatar },
+    fields: [
+      { name: '🅰️ Old', value: before ? truncate(before, 256) : '*none*', inline: true },
+      { name: '🆕 New', value: after ? truncate(after, 256) : '*cleared*', inline: true },
+    ],
+  });
+}
+
+export async function logMemberRoleChange(
+  client: Client,
+  guildId: string,
+  user: { id: string; tag: string; avatar?: string },
+  added: Role[],
+  removed: Role[],
+): Promise<SendResult> {
+  const fields: EmbedField[] = [];
+  if (added.length) {
+    fields.push({
+      name: `➕ Roles added (${added.length})`,
+      value: added.map((r) => `<@&${r.id}>`).join(' ').slice(0, 1024) || '*none*',
+      inline: false,
+    });
+  }
+  if (removed.length) {
+    fields.push({
+      name: `➖ Roles removed (${removed.length})`,
+      value: removed.map((r) => `<@&${r.id}>`).join(' ').slice(0, 1024) || '*none*',
+      inline: false,
+    });
+  }
+  if (!fields.length) {
+    fields.push({ name: 'ℹ️ Note', value: '*No roles changed (audit log re-attribution)*', inline: false });
+  }
+  return logEvent({
+    client,
+    guildId,
+    category: 'role',
+    title: 'Member roles updated',
+    description: `${user.tag} ${added.length ? 'received' : ''}${added.length && removed.length ? ' and ' : ''}${removed.length ? 'lost' : ''} role${added.length + removed.length === 1 ? '' : 's'}.`,
+    actor: { id: user.id, tag: user.tag, avatar: user.avatar },
+    target: { id: user.id, tag: user.tag, avatar: user.avatar },
+    fields,
+  });
+}
+
+export async function logMemberTimeoutChange(
+  client: Client,
+  guildId: string,
+  user: { id: string; tag: string; avatar?: string },
+  before: Date | null | undefined,
+  after: Date | null | undefined,
+): Promise<SendResult> {
+  const beforeStr = before ? `<t:${Math.floor(before.getTime() / 1000)}:F>` : '*none*';
+  const afterStr = after ? `<t:${Math.floor(after.getTime() / 1000)}:F> (<t:${Math.floor(after.getTime() / 1000)}:R>)` : '*cleared*';
+  const fields: EmbedField[] = [
+    { name: '⏱️ Previous', value: beforeStr, inline: true },
+    { name: '⏱️ Current', value: afterStr, inline: true },
+  ];
+  if (after) {
+    const remainingMs = after.getTime() - Date.now();
+    if (remainingMs > 0) {
+      fields.push({ name: '⏳ Remaining', value: `\`${truncateMs(remainingMs)}\``, inline: true });
+    }
+  }
+  return logEvent({
+    client,
+    guildId,
+    category: 'moderation',
+    title: after ? 'Member timed out' : 'Timeout cleared',
+    description: `${user.tag} ${after ? 'was put in timeout' : 'had their timeout cleared'}.`,
+    actor: { id: user.id, tag: user.tag, avatar: user.avatar },
+    target: { id: user.id, tag: user.tag, avatar: user.avatar },
+    fields,
+  });
+}
+
+export async function logMemberBoostChange(
+  client: Client,
+  guildId: string,
+  user: { id: string; tag: string; avatar?: string },
+  now: 'start' | 'end',
+): Promise<SendResult> {
+  return logEvent({
+    client,
+    guildId,
+    category: 'server',
+    title: now === 'start' ? 'Server boost started' : 'Server boost ended',
+    description: now === 'start'
+      ? `${user.tag} started boosting the server.`
+      : `${user.tag} stopped boosting the server.`,
+    actor: { id: user.id, tag: user.tag, avatar: user.avatar },
+    target: { id: user.id, tag: user.tag, avatar: user.avatar },
+  });
+}
+
+/**
+ * Log a single message deletion.
+ *
+ * Partial messages are handled safely: if Discord doesn't have the
+ * message cached we render a "content unavailable" placeholder instead
+ * of failing. `m.fetch()` errors are swallowed.
+ */
+export async function logMessageDelete(
+  client: Client,
+  guildId: string,
+  data: {
+    message: Message | PartialMessage;
+    executor: ActorInfo | null;
+    reason?: string | null;
+  },
+): Promise<SendResult> {
+  const m = data.message;
+  const channelId = m.channel?.id;
+  if (!channelId) return { ok: false, eventId: '-', reason: 'No channel' };
+
+  // Respect per-channel ignore list BEFORE building the embed.
+  if (isChannelIgnoredForLogs(guildId, channelId)) {
+    return { ok: false, eventId: '-', reason: 'Channel ignored' };
+  }
+
+  const partial = !!m.partial;
+
+  // Try to fetch full message if we have a partial. Never throws.
+  const full = await safeFetchMessage(m);
+
+  const fields: EmbedField[] = [
+    { name: '📍 Channel', value: `<#${channelId}>`, inline: true },
+    { name: '🆔 Message ID', value: `\`${m.id}\``, inline: true },
+  ];
+
+  // Author extraction — works for both full and partial messages.
+  let authorTag = 'Unknown';
+  let authorId = 'Unknown';
+  let authorAvatar: string | undefined;
+  if (m.author) {
+    authorId = m.author.id;
+    authorTag = m.author.tag ?? `${m.author.username}#${m.author.discriminator ?? '0000'}`;
+    authorAvatar = m.author.displayAvatarURL?.();
+  } else if (full?.author) {
+    authorId = full.author.id;
+    authorTag = full.author.tag ?? `${full.author.username}#${full.author.discriminator ?? '0000'}`;
+    authorAvatar = full.author.displayAvatarURL?.();
+  }
+
+  if (authorId !== 'Unknown') {
+    fields.push({ name: '👤 Author', value: `<@${authorId}>\n\`${authorTag}\`\n\`${authorId}\``, inline: true });
+  }
+
+  // Content extraction — handles text, attachments, embeds, partial state.
+  let content: string | null = null;
+  if (full) {
+    if (full.content && full.content.length) {
+      content = truncate(full.content, 1024);
+    } else if (full.attachments && full.attachments.size > 0) {
+      const list = full.attachments.map((a) => `[${a.name}](${a.url})`).slice(0, 5);
+      content = `📎 ${full.attachments.size} attachment${full.attachments.size === 1 ? '' : 's'}:\n${list.join(', ')}`;
+    } else if (full.embeds && full.embeds.length > 0) {
+      content = `🖼 ${full.embeds.length} embed${full.embeds.length === 1 ? '' : 's'}`;
+    }
+  }
+
+  if (content) {
+    fields.push({ name: '💬 Content', value: content, inline: false });
+  } else if (partial) {
+    fields.push({ name: '💬 Content', value: '*content unavailable*', inline: false });
+  } else {
+    fields.push({ name: '💬 Content', value: '*empty message*', inline: false });
+  }
+
+  if (data.executor) {
+    fields.push({
+      name: '🛠 Deleted by',
+      value: `<@${data.executor.id}>\n\`${data.executor.tag}\`\n\`${data.executor.id}\``,
+      inline: true,
+    });
+  } else {
+    fields.push({ name: '🛠 Deleted by', value: '*self-deleted or unknown*', inline: true });
+  }
+  if (data.reason) {
+    fields.push({ name: '📝 Audit reason', value: truncate(data.reason, 512), inline: false });
+  }
+
+  return logEvent({
+    client,
+    guildId,
+    category: 'message',
+    title: partial ? 'Message deleted (partial)' : 'Message deleted',
+    description: partial ? '*Partial message — content may be unavailable*' : undefined,
+    actor: data.executor,
+    target: authorId !== 'Unknown' ? { id: authorId, tag: authorTag, avatar: authorAvatar } : null,
+    channelId,
+    fields,
+  });
+}
+
+/**
+ * Log a bulk message delete.
+ *
+ * Up to the first 5 messages are previewed. Partial messages are
+ * fetched lazily; if the fetch fails, the preview shows "*unavailable*".
+ */
+export async function logMessageBulkDelete(
+  client: Client,
+  guildId: string,
+  data: {
+    channelId: string;
+    channelName?: string;
+    count: number;
+    messages: Array<Message | PartialMessage>;
+    executor: ActorInfo | null;
+  },
+): Promise<SendResult> {
+  if (isChannelIgnoredForLogs(guildId, data.channelId)) {
+    return { ok: false, eventId: '-', reason: 'Channel ignored' };
+  }
+
+  const preview: string[] = [];
+  for (const m of data.messages.slice(0, 5)) {
+    let content = '';
+    if (m.partial) {
+      const full = await safeFetchMessage(m);
+      content = (full?.content ?? '').slice(0, 100);
+    } else {
+      content = (m.content ?? '').slice(0, 100);
+    }
+    const author = m.author?.tag ?? 'unknown';
+    preview.push(`• \`${author}\`: ${content || '*empty*'}`);
+  }
+
+  const fields: EmbedField[] = [
+    { name: '📍 Channel', value: `<#${data.channelId}>`, inline: true },
+    { name: '🧮 Messages', value: `\`${data.count}\``, inline: true },
+  ];
+  if (data.executor) {
+    fields.push({
+      name: '🛠 Purged by',
+      value: `<@${data.executor.id}>\n\`${data.executor.tag}\``,
+      inline: true,
+    });
+  }
+  if (preview.length) {
+    fields.push({ name: '📄 Preview (first 5)', value: truncate(preview.join('\n'), 1024), inline: false });
+  }
+
+  return logEvent({
+    client,
+    guildId,
+    category: 'message',
+    title: 'Bulk message delete',
+    description: `${data.count} message${data.count === 1 ? '' : 's'} purged in <#${data.channelId}>.`,
+    actor: data.executor,
+    target: null,
+    channelId: data.channelId,
+    fields,
+  });
+}
+
+export async function logMessageEdit(
+  client: Client,
+  guildId: string,
+  data: {
+    before: string;
+    after: string;
+    message: Message | PartialMessage;
+    author: ActorInfo | null;
+  },
+): Promise<SendResult> {
+  const m = data.message;
+  if (isChannelIgnoredForLogs(guildId, m.channel.id)) {
+    return { ok: false, eventId: '-', reason: 'Channel ignored' };
+  }
+  const fields: EmbedField[] = [
+    { name: '📍 Channel', value: `<#${m.channel.id}>`, inline: true },
+    { name: '🆔 Message ID', value: `\`${m.id}\``, inline: true },
+    { name: '🅰️ Before', value: data.before ? `\`\`\`\n${truncate(data.before, 900)}\n\`\`\`` : '*empty*', inline: false },
+    { name: '🆕 After', value: data.after ? `\`\`\`\n${truncate(data.after, 900)}\n\`\`\`` : '*empty*', inline: false },
+  ];
+  if ('url' in m && m.url) {
+    fields.push({ name: '🔗 Jump', value: `[Open message](${m.url})`, inline: false });
+  }
+  return logEvent({
+    client,
+    guildId,
+    category: 'message',
+    title: 'Message edited',
+    actor: data.author,
+    target: data.author,
+    channelId: m.channel.id,
+    fields,
+  });
+}
+
+export async function logBanAdd(
+  client: Client,
+  guildId: string,
+  ban: GuildBan,
+  executor: ActorInfo | null,
+  reason: string | null,
+): Promise<SendResult> {
+  const user = ban.user;
+  const fields: EmbedField[] = [
+    { name: '👤 User', value: `<@${user.id}>\n\`${user.tag ?? user.id}\`\n\`${user.id}\``, inline: true },
+    { name: '🤖 Bot', value: user.bot ? '✅ Yes' : '❌ No', inline: true },
+  ];
+  if (reason) fields.push({ name: '📝 Reason', value: truncate(reason, 512), inline: false });
+
+  return logEvent({
+    client,
+    guildId,
+    category: 'moderation',
+    title: 'Member banned',
+    description: `${user.tag ?? user.id} was banned.`,
+    actor: executor,
+    target: { id: user.id, tag: user.tag ?? user.id, avatar: user.displayAvatarURL?.() },
+    fields,
+  });
+}
+
+export async function logBanRemove(
+  client: Client,
+  guildId: string,
+  ban: GuildBan,
+  executor: ActorInfo | null,
+  reason: string | null,
+): Promise<SendResult> {
+  const user = ban.user;
+  const fields: EmbedField[] = [
+    { name: '👤 User', value: `<@${user.id}>\n\`${user.tag ?? user.id}\`\n\`${user.id}\``, inline: true },
+  ];
+  if (reason) fields.push({ name: '📝 Reason', value: truncate(reason, 512), inline: false });
+  return logEvent({
+    client,
+    guildId,
+    category: 'moderation',
+    title: 'Member unbanned',
+    description: `${user.tag ?? user.id} was unbanned.`,
+    actor: executor,
+    target: { id: user.id, tag: user.tag ?? user.id, avatar: user.displayAvatarURL?.() },
+    fields,
+  });
+}
+
+export async function logChannelEvent(
+  client: Client,
+  guildId: string,
+  data: {
+    action: 'create' | 'delete' | 'update';
+    channel: GuildChannel;
+    before?: GuildChannel | null;
+    executor: ActorInfo | null;
+    reason?: string | null;
+  },
+): Promise<SendResult> {
+  const fields: EmbedField[] = [
+    { name: '📌 Type', value: `\`${data.channel.type}\``, inline: true },
+    { name: '🆔 Channel ID', value: `\`${data.channel.id}\``, inline: true },
+  ];
+  if (data.action === 'update' && data.before) {
+    const changes: string[] = [];
+    if (data.before.name !== data.channel.name) {
+      changes.push(`Name: \`${data.before.name}\` → \`${data.channel.name}\``);
+    }
+    if ('topic' in data.before && 'topic' in data.channel && data.before.topic !== data.channel.topic) {
+      changes.push(`Topic changed`);
+    }
+    if ('parentId' in data.channel) {
+      changes.push(`Parent: \`${(data.before as any).parentId ?? 'none'}\` → \`${(data.channel as any).parentId ?? 'none'}\``);
+    }
+    if (changes.length) {
+      fields.push({ name: '🔄 Changes', value: changes.map((c) => `• ${c}`).join('\n').slice(0, 1024), inline: false });
+    } else {
+      fields.push({ name: '🔄 Changes', value: '*Permission overwrite updated*', inline: false });
+    }
+  }
+  if (data.executor) {
+    fields.push({
+      name: '🛠 By',
+      value: `<@${data.executor.id}>\n\`${data.executor.tag}\``,
+      inline: true,
+    });
+  }
+  if (data.reason) {
+    fields.push({ name: '📝 Reason', value: truncate(data.reason, 512), inline: false });
+  }
+
+  const title =
+    data.action === 'create' ? 'Channel created' :
+    data.action === 'delete' ? 'Channel deleted' :
+    'Channel updated';
+
+  return logEvent({
+    client,
+    guildId,
+    category: 'channel',
+    title,
+    description: `${data.channel.name ?? data.channel.id}`,
+    actor: data.executor,
+    target: null,
+    fields,
+  });
+}
+
+export async function logRoleEvent(
+  client: Client,
+  guildId: string,
+  data: {
+    action: 'create' | 'delete' | 'update';
+    role: Role;
+    before?: Role | null;
+    executor: ActorInfo | null;
+    reason?: string | null;
+  },
+): Promise<SendResult> {
+  const fields: EmbedField[] = [
+    { name: '🎨 Color', value: `\`${data.role.hexColor ?? 'default'}\``, inline: true },
+    { name: '📣 Mentionable', value: data.role.mentionable ? '✅ Yes' : '❌ No', inline: true },
+    { name: '🚩 Hoisted', value: data.role.hoist ? '✅ Yes' : '❌ No', inline: true },
+  ];
+  if (data.action === 'update' && data.before) {
+    const changes: string[] = [];
+    if (data.before.name !== data.role.name) {
+      changes.push(`Name: \`${data.before.name}\` → \`${data.role.name}\``);
+    }
+    if (data.before.hexColor !== data.role.hexColor) {
+      changes.push(`Color: \`${data.before.hexColor}\` → \`${data.role.hexColor}\``);
+    }
+    if (data.before.permissions.bitfield !== data.role.permissions.bitfield) {
+      changes.push(`Permissions updated (\`${data.role.permissions.bitfield.toString()}\`)`);
+    }
+    if (changes.length) {
+      fields.push({ name: '🔄 Changes', value: changes.map((c) => `• ${c}`).join('\n').slice(0, 1024), inline: false });
+    }
+  }
+  if (data.executor) {
+    fields.push({
+      name: '🛠 By',
+      value: `<@${data.executor.id}>\n\`${data.executor.tag}\``,
+      inline: true,
+    });
+  }
+  if (data.reason) {
+    fields.push({ name: '📝 Reason', value: truncate(data.reason, 512), inline: false });
+  }
+
+  const title =
+    data.action === 'create' ? 'Role created' :
+    data.action === 'delete' ? 'Role deleted' :
+    'Role updated';
+
+  return logEvent({
+    client,
+    guildId,
+    category: 'role',
+    title,
+    description: `${data.role.name}`,
+    actor: data.executor,
+    target: null,
+    fields,
+  });
+}
+
+export async function logWebhookEvent(
+  client: Client,
+  guildId: string,
+  data: {
+    action: 'create' | 'update' | 'delete';
+    channelId: string;
+    webhookId: string | null;
+    executor: ActorInfo | null;
+    reason?: string | null;
+  },
+): Promise<SendResult> {
+  const fields: EmbedField[] = [
+    { name: '📍 Channel', value: `<#${data.channelId}>`, inline: true },
+    { name: '🆔 Webhook ID', value: data.webhookId ? `\`${data.webhookId}\`` : '*unknown*', inline: true },
+  ];
+  if (data.executor) {
+    fields.push({
+      name: '🛠 By',
+      value: `<@${data.executor.id}>\n\`${data.executor.tag}\``,
+      inline: true,
+    });
+  }
+  if (data.reason) {
+    fields.push({ name: '📝 Reason', value: truncate(data.reason, 512), inline: false });
+  }
+
+  const title =
+    data.action === 'create' ? 'Webhook created' :
+    data.action === 'delete' ? 'Webhook deleted' :
+    'Webhook updated';
+
+  return logEvent({
+    client,
+    guildId,
+    category: 'webhook',
+    title,
+    description: data.action === 'create'
+      ? `A webhook was created in <#${data.channelId}>.`
+      : data.action === 'delete'
+        ? `A webhook in <#${data.channelId}> was deleted.`
+        : `A webhook in <#${data.channelId}> was updated.`,
+    actor: data.executor,
+    target: null,
+    channelId: data.channelId,
+    fields,
+  });
+}
+
+// ---------- Helpers ----------
+
+/**
+ * Millisecond → readable duration.
+ */
+function truncateMs(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  const m = Math.floor(s / 60);
+  const h = Math.floor(m / 60);
+  const d = Math.floor(h / 24);
+  const parts: string[] = [];
+  if (d > 0) parts.push(`${d}d`);
+  if (h % 24 > 0) parts.push(`${h % 24}h`);
+  if (m % 60 > 0 && d === 0) parts.push(`${m % 60}m`);
+  if (s % 60 > 0 && h === 0 && d === 0) parts.push(`${s % 60}s`);
+  return parts.join(' ') || '0s';
+}
+
 /** Re-export for tests / embed builders. */
-export const __internal = { buildLogEmbed, generateEventId, toneForCategory };
+export const __internal = { buildLogEmbed, generateEventId, toneForCategory, safeFetchMessage };
+
+// Avoid unused-warning linting in strict TS.
+export type _AuditLogEvent = AuditLogEvent;

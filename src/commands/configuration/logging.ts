@@ -129,6 +129,9 @@ const def: CommandDefinition = {
       }
       const before = getLoggingConfig(ctx.guild.id, category).channelId;
       setLoggingChannel(ctx.guild.id, category, channel.id);
+      // setLoggingChannel already enables the row, but call it
+      // explicitly so future schema changes that decouple the two are
+      // surfaced at this call site.
       setLoggingEnabled(ctx.guild.id, category, true);
       await respond(ctx, {
         embeds: [configChange({
@@ -142,9 +145,16 @@ const def: CommandDefinition = {
     }
 
     if (sub === 'disable') {
-      if (!category) return;
+      if (!category || !LOG_CATEGORIES.includes(category as LogCategory)) {
+        await respond(ctx, { embeds: [buildEmbed({ tone: 'error', title: '✗ Invalid category' })] });
+        return;
+      }
       const before = getLoggingConfig(ctx.guild.id, category).channelId;
-      setLoggingEnabled(ctx.guild.id, category, false);
+      const ok = setLoggingEnabled(ctx.guild.id, category, false);
+      if (!ok) {
+        await respond(ctx, { embeds: [buildEmbed({ tone: 'warning', title: '⚠ Nothing to disable', description: `\`${category}\` has no channel configured.` }) ] });
+        return;
+      }
       await respond(ctx, {
         embeds: [configChange({
           setting: `Logging: \`${category}\``,

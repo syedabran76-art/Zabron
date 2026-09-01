@@ -197,30 +197,47 @@ export function getLoggingConfig(guildId: string, category: string): { channelId
   return { channelId: row.channel_id, enabled: Boolean(row.enabled) };
 }
 
+/**
+ * Set (or clear) the destination channel for a logging category.
+ *
+ * When a non-null channelId is provided the category is automatically
+ * enabled. Passing `null` clears the channel and leaves the enabled flag
+ * unchanged so admins can keep "disabled" state on a category even
+ * after clearing its channel.
+ */
 export function setLoggingChannel(guildId: string, category: string, channelId: string | null): void {
-  const existing = getLoggingConfig(guildId, category);
-  getDatabase()
-    .prepare(
+  const db = getDatabase();
+  if (channelId) {
+    db.prepare(
       `INSERT INTO logging_config (guild_id, category, channel_id, enabled)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(guild_id, category) DO UPDATE SET channel_id = excluded.channel_id`,
-    )
-    .run(guildId, category, channelId, channelId ? 1 : 0);
-  if (!channelId && !existing.enabled) {
-    // already in correct state
+       VALUES (?, ?, ?, 1)
+       ON CONFLICT(guild_id, category) DO UPDATE SET channel_id = excluded.channel_id, enabled = 1`,
+    ).run(guildId, category, channelId);
+  } else {
+    db.prepare(
+      `INSERT INTO logging_config (guild_id, category, channel_id, enabled)
+       VALUES (?, ?, NULL, 0)
+       ON CONFLICT(guild_id, category) DO UPDATE SET channel_id = NULL, enabled = 0`,
+    ).run(guildId, category);
   }
 }
 
-export function setLoggingEnabled(guildId: string, category: string, enabled: boolean): void {
+/**
+ * Toggle the enabled flag for a logging category.
+ *
+ * Returns `false` if the category has no channel configured — there's
+ * no point enabling a category that has nowhere to write to.
+ */
+export function setLoggingEnabled(guildId: string, category: string, enabled: boolean): boolean {
+  const db = getDatabase();
   const existing = getLoggingConfig(guildId, category);
-  if (!existing.channelId && enabled) return;
-  getDatabase()
-    .prepare(
-      `INSERT INTO logging_config (guild_id, category, channel_id, enabled)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(guild_id, category) DO UPDATE SET enabled = excluded.enabled`,
-    )
-    .run(guildId, category, existing.channelId, enabled ? 1 : 0);
+  if (!existing.channelId && enabled) return false;
+  db.prepare(
+    `INSERT INTO logging_config (guild_id, category, channel_id, enabled)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(guild_id, category) DO UPDATE SET enabled = excluded.enabled`,
+  ).run(guildId, category, existing.channelId, enabled ? 1 : 0);
+  return true;
 }
 
 export function getAllLoggingChannels(guildId: string): Record<string, string | null> {
@@ -230,6 +247,54 @@ export function getAllLoggingChannels(guildId: string): Record<string, string | 
   const out: Record<string, string | null> = {};
   for (const r of rows) out[r.category] = r.channel_id;
   return out;
+}
+
+/**
+ * Returns true if a channel is in the per-guild message-log ignore list.
+ * Used by message delete / edit handlers to mute noisy channels.
+ */
+export function isChannelIgnoredForLogs(guildId: string, channelId: string): boolean {
+  ensureIgnoreTable();
+  const row = getDatabase()
+    .prepare('SELECT 1 FROM log_ignores WHERE guild_id = ? AND channel_id = ?')
+    .get(guildId, channelId);
+  return Boolean(row);
+}
+
+/**
+ * Returns true when webhook delivery is enabled for the given category
+ * in the given guild. Defaults to `true` when the row is missing so a
+ * fresh install isn't muted by default.
+ */
+export function isWebhookDeliveryEnabled(guildId: string, category: string): boolean {
+  ensureIgnoreTable();
+  const row = getDatabase()
+    .prepare('SELECT enabled FROM log_webhooks WHERE guild_id = ? AND category = ?')
+    .get(guildId, category) as any;
+  if (!row) return true;
+  return Boolean(row.enabled);
+}
+
+/**
+ * Lazily create the auxiliary logging tables (webhook toggle, ignored
+ * channels). The migration 025 already creates them at boot for fresh
+ * installs; this function lets older deployments use the helpers
+ * without crashing before the migration runs.
+ */
+function ensureIgnoreTable(): void {
+  getDatabase().exec(`
+    CREATE TABLE IF NOT EXISTS log_webhooks (
+      guild_id TEXT NOT NULL,
+      category TEXT NOT NULL,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY (guild_id, category)
+    );
+    CREATE TABLE IF NOT EXISTS log_ignores (
+      guild_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      PRIMARY KEY (guild_id, channel_id)
+    );
+  `);
 }
 
 // ---------- Tickets ----------

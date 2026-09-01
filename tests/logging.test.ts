@@ -457,3 +457,286 @@ test('logging service: toneForCategory maps correctly', () => {
   assert.strictEqual(toneForCategory('tickets'), 'ticket');
   assert.strictEqual(toneForCategory('leveling'), 'leveling');
 });
+
+// ============================================================================
+// Member role-update actor attribution (regression for the "target-as-actor"
+// bug where moderator role changes were attributed to the affected member).
+// ============================================================================
+
+import {
+  logMemberRoleChange,
+} from '../src/services/logging.js';
+import type { Role, Client } from 'discord.js';
+
+/**
+ * Build a minimal fake Role object sufficient for logMemberRoleChange.
+ * The function only uses `r.id` (for `<@&id>` mentions), so we don't
+ * need to instantiate a full discord.js Role.
+ */
+function fakeRole(id: string, name: string): Role {
+  return { id, name } as unknown as Role;
+}
+
+/**
+ * Stub client that captures any embed sent via the configured logging
+ * channel. Each test uses a unique guildId so the channel cache
+ * lookup matches the test's guild config.
+ *
+ * IMPORTANT: we return a `getLastEmbed()` accessor instead of a
+ * destructured `lastEmbed` value because the `send` closure mutates
+ * the SAME `state` object we return — destructuring would snapshot
+ * the (still-null) value at destructure time, before `send` is
+ * called.
+ */
+function stubClient(
+  channelId: string,
+  guildId: string,
+): {
+  client: Client;
+  state: { lastEmbed: { embed: any; payload: any } | null };
+  getLastEmbed: () => { embed: any; payload: any } | null;
+} {
+  const state: { lastEmbed: { embed: any; payload: any } | null } = { lastEmbed: null };
+  const channel = {
+    id: channelId,
+    type: 0, // GuildText
+    isTextBased: () => true,
+    send: async (payload: any) => {
+      state.lastEmbed = { embed: payload.embeds?.[0] ?? null, payload };
+      return payload;
+    },
+  };
+  const guild = { id: guildId, channels: { fetch: async () => channel } };
+  // Minimal Discord client stub — logEvent only calls `client.guilds.cache.get`
+  // and `client.user.displayAvatarURL()`, so a tiny fake is enough.
+  const client = {
+    guilds: {
+      cache: new Map([[guildId, guild]]),
+      fetch: async () => guild,
+    },
+    user: { id: 'bot', displayAvatarURL: () => 'https://cdn/bot' },
+  } as unknown as Client;
+  return { client, state, getLastEmbed: () => state.lastEmbed };
+}
+
+test('logMemberRoleChange: moderator (executor) → actor=moderator, target=member', async () => {
+  const { client, getLastEmbed } = stubClient('ch-roles', 'g-roles-mod');
+  // Configure log channel for the 'role' category so logEvent routes.
+  setLoggingChannel('g-roles-mod', 'role', 'ch-roles');
+
+  const moderator = { id: 'mod-z8phyr', tag: 'z8phyr#0001', avatar: 'https://cdn/mod' };
+  const member = { id: 'target-user', tag: 'target#0001', avatar: 'https://cdn/target' };
+  const added = [fakeRole('role-unbypass', 'Unbypass'), fakeRole('role-supporters', 'Supporters')];
+  const removed: Role[] = [];
+
+  await logMemberRoleChange(client, 'g-roles-mod', member, added, removed, moderator);
+  const lastEmbed = getLastEmbed();
+
+  assert.ok(lastEmbed, 'embed should have been sent');
+  const fields = lastEmbed!.embed.toJSON().fields ?? [];
+  const actorField = fields.find((f: any) => f.name === '👤 Actor');
+  const targetField = fields.find((f: any) => f.name === '🎯 Target');
+  assert.ok(actorField, 'actor field should be present');
+  assert.ok(targetField, 'target field should be present');
+
+  // Actor MUST mention the moderator, NOT the target.
+  assert.match(actorField!.value, /<@mod-z8phyr>/, 'actor should mention moderator id');
+  assert.match(actorField!.value, /mod-z8phyr/, 'actor should include moderator id');
+  assert.doesNotMatch(actorField!.value, /<@target-user>/, 'actor must not mention the target member');
+
+  // Target MUST mention the affected member.
+  assert.match(targetField!.value, /<@target-user>/, 'target should mention the affected member');
+  assert.match(targetField!.value, /target-user/, 'target should include the affected member id');
+
+  // Roles added must be preserved (embed renders role IDs as <@&id>).
+  const rolesField = fields.find((f: any) => f.name?.startsWith('➕ Roles added'));
+  assert.ok(rolesField, 'roles-added field should be present');
+  assert.match(rolesField!.value, /role-unbypass/, 'roles-added must include the role id');
+  assert.match(rolesField!.value, /role-supporters/, 'roles-added must include the supporters role id');
+});
+
+test('logMemberRoleChange: target member id MUST NOT be used as actor', async () => {
+  const { client, getLastEmbed } = stubClient('ch-roles-2', 'g-roles-no-target-actor');
+  setLoggingChannel('g-roles-no-target-actor', 'role', 'ch-roles-2');
+
+  const member = { id: 'target-z8phyr', tag: 'z8phyr#0001', avatar: 'https://cdn/x' };
+  const moderator = { id: 'mod-other', tag: 'mod#0001' };
+
+  // When executor IS supplied, target id must not leak into actor.
+  await logMemberRoleChange(client, 'g-roles-no-target-actor', member, [fakeRole('r1', 'One')], [], moderator);
+  const lastEmbed = getLastEmbed();
+
+  const json = lastEmbed!.embed.toJSON();
+  const fields = json.fields ?? [];
+  const actorField = fields.find((f: any) => f.name === '👤 Actor');
+  const targetField = fields.find((f: any) => f.name === '🎯 Target');
+
+  assert.ok(actorField);
+  assert.ok(targetField);
+  // Extract ids from the field value. Embed renders users as <@id>
+  // and ALSO includes the raw id in a backtick code block. Either is
+  // fine for our purposes — we check that the moderator's id appears
+  // in the actor field and the target's id in the target field, but
+  // they do NOT cross-contaminate.
+  const actorValue = actorField!.value;
+  const targetValue = targetField!.value;
+  assert.match(actorValue, /mod-other/, 'actor field must reference the moderator');
+  assert.match(targetValue, /target-z8phyr/, 'target field must reference the affected member');
+  assert.doesNotMatch(actorValue, /target-z8phyr/, 'actor field must NOT reference the target');
+  assert.doesNotMatch(targetValue, /mod-other/, 'target field must NOT reference the moderator');
+});
+
+test('logMemberRoleChange: missing audit executor → actor="Unknown", target preserved', async () => {
+  const { client, getLastEmbed } = stubClient('ch-roles-unknown', 'g-roles-unknown');
+  setLoggingChannel('g-roles-unknown', 'role', 'ch-roles-unknown');
+
+  const member = { id: 'target-no-audit', tag: 'noaudit#0001' };
+  const added = [fakeRole('rA', 'A')];
+
+  // Explicit null executor: audit log returned no entry.
+  await logMemberRoleChange(client, 'g-roles-unknown', member, added, [], null);
+  const lastEmbed = getLastEmbed();
+
+  const fields = lastEmbed!.embed.toJSON().fields ?? [];
+  const actorField = fields.find((f: any) => f.name === '👤 Actor');
+  const targetField = fields.find((f: any) => f.name === '🎯 Target');
+
+  assert.ok(actorField, 'actor field must still render when executor is null');
+  assert.match(actorField!.value, /Unknown/, 'actor must say "Unknown"');
+  assert.doesNotMatch(actorField!.value, /<@target-no-audit>/, 'actor must NOT be the target');
+
+  assert.ok(targetField, 'target field must be preserved');
+  assert.match(targetField!.value, /target-no-audit/);
+  assert.match(targetField!.value, /noaudit#0001/);
+});
+
+test('logMemberRoleChange: omitted executor (default arg) → actor="Unknown", never target', async () => {
+  const { client, getLastEmbed } = stubClient('ch-roles-default', 'g-roles-default');
+  setLoggingChannel('g-roles-default', 'role', 'ch-roles-default');
+
+  const member = { id: 'target-default', tag: 'defaulttarget#0001' };
+
+  // No executor argument at all (default = null).
+  await logMemberRoleChange(client, 'g-roles-default', member, [fakeRole('rB', 'B')], []);
+  const lastEmbed = getLastEmbed();
+
+  const actorField = (lastEmbed!.embed.toJSON().fields ?? []).find((f: any) => f.name === '👤 Actor');
+  assert.match(actorField!.value, /Unknown/);
+  assert.doesNotMatch(actorField!.value, /target-default/, 'actor must never default to the target');
+});
+
+test('logMemberRoleChange: stale/mismatched audit entry → actor="Unknown"', async () => {
+  // Drive resolveAuditExecutor directly with a STALE entry — the
+  // resolver should reject it and return null. logMemberRoleChange
+  // must then render "Unknown" for the actor.
+  const stale = Date.now() - 5 * 60_000; // 5 min ago — outside 30s window
+  const { guild } = fakeGuildAndAudit([
+    {
+      action: 25, // MemberRoleUpdate
+      targetId: 'target-stale',
+      createdTimestamp: stale,
+      executorId: 'mod-stale',
+      executorTag: 'stale#0001',
+    },
+    {
+      action: 25,
+      targetId: 'target-other',
+      createdTimestamp: Date.now(), // recent, but wrong target
+      executorId: 'mod-other',
+      executorTag: 'other#0001',
+    },
+  ]);
+
+  const resolution = await resolveAuditExecutor({
+    guild,
+    action: 25,
+    targetId: 'target-stale',
+    maxAgeMs: 30_000,
+    limit: 5,
+  });
+
+  // Resolver must NOT return either entry:
+  //   - the stale entry fails the age filter,
+  //   - the recent entry fails the targetId filter.
+  assert.strictEqual(resolution.executor, null, 'stale + mismatched → null executor');
+  assert.strictEqual(resolution.executorId, null);
+
+  // Now pass that null into logMemberRoleChange and verify the embed.
+  const { client, getLastEmbed } = stubClient('ch-roles-stale', 'g-roles-stale');
+  setLoggingChannel('g-roles-stale', 'role', 'ch-roles-stale');
+  const member = { id: 'target-stale', tag: 'staletarget#0001' };
+
+  await logMemberRoleChange(client, 'g-roles-stale', member, [fakeRole('rS', 'S')], [], resolution.executor);
+  const lastEmbed = getLastEmbed();
+
+  const fields = lastEmbed!.embed.toJSON().fields ?? [];
+  const actorField = fields.find((f: any) => f.name === '👤 Actor');
+  const targetField = fields.find((f: any) => f.name === '🎯 Target');
+
+  assert.ok(actorField);
+  assert.match(actorField!.value, /Unknown/, 'stale audit → Unknown actor');
+  assert.doesNotMatch(actorField!.value, /mod-stale/, 'must not use the stale executor');
+  assert.doesNotMatch(actorField!.value, /mod-other/, 'must not use the mismatched executor');
+  assert.doesNotMatch(actorField!.value, /<@target-stale>/, 'must not use the target');
+
+  // Target should still be intact.
+  assert.ok(targetField);
+  assert.match(targetField!.value, /target-stale/);
+});
+
+test('logMemberRoleChange: audit entry with null executor → actor="Unknown"', async () => {
+  // Entry exists and matches target, but the entry has no executor
+  // (rare but possible during Discord incidents). The resolver returns
+  // null. logMemberRoleChange must render "Unknown".
+  const { guild } = fakeGuildAndAudit([
+    {
+      action: 25,
+      targetId: 'target-noexec',
+      createdTimestamp: Date.now(),
+      executorId: null, // executor field is missing on the entry
+    },
+  ]);
+  const resolution = await resolveAuditExecutor({
+    guild,
+    action: 25,
+    targetId: 'target-noexec',
+    maxAgeMs: 30_000,
+    limit: 5,
+  });
+  assert.strictEqual(resolution.executor, null);
+
+  const { client, getLastEmbed } = stubClient('ch-roles-noexec', 'g-roles-noexec');
+  setLoggingChannel('g-roles-noexec', 'role', 'ch-roles-noexec');
+  const member = { id: 'target-noexec', tag: 'noexec#0001' };
+
+  await logMemberRoleChange(client, 'g-roles-noexec', member, [fakeRole('rN', 'N')], [], resolution.executor);
+  const lastEmbed = getLastEmbed();
+
+  const actorField = (lastEmbed!.embed.toJSON().fields ?? []).find((f: any) => f.name === '👤 Actor');
+  assert.match(actorField!.value, /Unknown/);
+  assert.doesNotMatch(actorField!.value, /target-noexec/);
+});
+
+test('logMemberRoleChange: role-removed field is preserved alongside actor/target', async () => {
+  const { client, getLastEmbed } = stubClient('ch-roles-rem', 'g-roles-rem');
+  setLoggingChannel('g-roles-rem', 'role', 'ch-roles-rem');
+
+  const moderator = { id: 'mod-rem', tag: 'remmod#0001' };
+  const member = { id: 'target-rem', tag: 'remtarget#0001' };
+  const removed = [fakeRole('role-old', 'OldRole')];
+
+  await logMemberRoleChange(client, 'g-roles-rem', member, [], removed, moderator);
+  const lastEmbed = getLastEmbed();
+
+  const fields = lastEmbed!.embed.toJSON().fields ?? [];
+  const removedField = fields.find((f: any) => f.name?.startsWith('➖ Roles removed'));
+  assert.ok(removedField, 'roles-removed field must be preserved');
+  // The embed renders roles as `<@&role-id>` mentions — verify the
+  // role id (not the display name) is in the embed value.
+  assert.match(removedField!.value, /role-old/, 'roles-removed must include the role id');
+
+  const actorField = fields.find((f: any) => f.name === '👤 Actor');
+  assert.match(actorField!.value, /mod-rem/);
+  const targetField = fields.find((f: any) => f.name === '🎯 Target');
+  assert.match(targetField!.value, /target-rem/);
+});

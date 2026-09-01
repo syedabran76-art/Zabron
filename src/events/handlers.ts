@@ -525,7 +525,19 @@ async function onMemberUpdate(o: GuildMember, n: GuildMember, client: any): Prom
   for (const id of after) if (!before.has(id)) added.push(n.roles.cache.get(id) as Role);
   for (const id of before) if (!after.has(id)) removed.push(o.roles.cache.get(id) as Role);
   if (added.length || removed.length) {
-    // Attribute to audit log where possible so we surface the moderator.
+    // Resolve the actor from the audit log so moderator-initiated role
+    // changes are attributed to the moderator (not the target member).
+    //
+    // The resolver:
+    //   - queries AuditLogEvent.MemberRoleUpdate entries,
+    //   - filters by `targetId: n.user.id` so we only consider role
+    //     changes for THIS member,
+    //   - rejects stale entries (>30s old) so unrelated previous role
+    //     actions are not attributed,
+    //   - returns `executor: null` when no entry matches or the entry
+    //     has no executor field (Discord outage, missing VIEW_AUDIT_LOG,
+    //     webhook actions, etc.). logMemberRoleChange then renders
+    //     "Unknown" for the actor — NEVER the target.
     let executor: ActorInfo | null = null;
     try {
       const audit = await resolveAuditExecutor({
@@ -537,16 +549,36 @@ async function onMemberUpdate(o: GuildMember, n: GuildMember, client: any): Prom
       });
       executor = audit.executor;
     } catch {}
+
     if (added.length || removed.length) {
-      await logMemberRoleChange(client, n.guild.id, {
-        id: n.user.id,
-        tag: n.user.tag ?? n.user.username ?? n.user.id,
-        avatar: n.user.displayAvatarURL?.(),
-      }, added, removed);
+      // Pass the resolved executor into the role-change log so the
+      // embed correctly shows:
+      //   - Actor: the moderator (or "Unknown")
+      //   - Target: the affected member
+      //   - Roles added / removed
+      // The previous behaviour incorrectly set both actor and target
+      // to the affected member.
+      await logMemberRoleChange(
+        client,
+        n.guild.id,
+        {
+          id: n.user.id,
+          tag: n.user.tag ?? n.user.username ?? n.user.id,
+          avatar: n.user.displayAvatarURL?.(),
+        },
+        added,
+        removed,
+        executor,
+      );
     }
-    // If we got an executor, log it under moderator category so admins
-    // can audit role changes performed by staff.
-    if (executor) {
+
+    // If the audit log identified an executor that is different from
+    // the target member, also surface a moderator-category log entry
+    // so staff have a dedicated feed for moderator-initiated changes.
+    // Self-role changes (executor.id === n.user.id) and unknown
+    // executors (null) are intentionally skipped to avoid duplicate
+    // or noisy logging.
+    if (executor && executor.id !== n.user.id) {
       await logEvent({
         client,
         guildId: n.guild.id,

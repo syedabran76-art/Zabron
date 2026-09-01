@@ -616,6 +616,27 @@ export async function logMemberRoleChange(
   user: { id: string; tag: string; avatar?: string },
   added: Role[],
   removed: Role[],
+  /**
+   * The Discord user who actually performed the role change, as
+   * resolved from the audit log (`AuditLogEvent.MemberRoleUpdate`).
+   *
+   * IMPORTANT: this is the ACTOR of the change — NOT the target
+   * member. The target member is `user`. Historically the embed used
+   * `user` as both actor and target, which incorrectly attributed
+   * moderator-initiated role changes to the affected member.
+   *
+   * Behaviour:
+   *   - When a non-null `executor` is provided, it is used as the
+   *     actor and `user` remains the target.
+   *   - When `executor` is `null` (audit log could not be resolved,
+   *     or the executor field is missing on the entry), the embed
+   *     shows "Unknown" for the actor — NEVER the target.
+   *   - When the executor IS the target (a member adding/removing
+   *     their own roles via Discord's profile UI or self-bot), the
+   *     executor is still shown as the actor, since that is the
+   *     accurate attribution.
+   */
+  executor: ActorInfo | null = null,
 ): Promise<SendResult> {
   const fields: EmbedField[] = [];
   if (added.length) {
@@ -635,13 +656,19 @@ export async function logMemberRoleChange(
   if (!fields.length) {
     fields.push({ name: 'ℹ️ Note', value: '*No roles changed (audit log re-attribution)*', inline: false });
   }
+  // Pass `executor` through directly. The audit-log resolver already
+  // guarantees it is either a real Discord user with an ID different
+  // from the target (when a moderator acted) or `null` when no
+  // attribution is available. We NEVER substitute `user` (the target)
+  // as a fallback — that was the original bug and would mis-attribute
+  // moderator actions to the affected member.
   return logEvent({
     client,
     guildId,
     category: 'role',
     title: 'Member roles updated',
     description: `${user.tag} ${added.length ? 'received' : ''}${added.length && removed.length ? ' and ' : ''}${removed.length ? 'lost' : ''} role${added.length + removed.length === 1 ? '' : 's'}.`,
-    actor: { id: user.id, tag: user.tag, avatar: user.avatar },
+    actor: executor, // null → embed renders "Unknown" via buildLogEmbed
     target: { id: user.id, tag: user.tag, avatar: user.avatar },
     fields,
   });
